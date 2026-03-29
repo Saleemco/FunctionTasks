@@ -1,0 +1,4362 @@
+const express = require('express');
+const { PrismaClient } = require('@prisma/client');
+const cors = require('cors');
+const multer = require('multer');
+const XLSX = require('xlsx');
+const fs = require('fs');
+
+const prisma = new PrismaClient();
+const app = express();
+const port = process.env.PORT || 3001;
+
+// Configure multer for file upload
+const upload = multer({ 
+  dest: 'uploads/',
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+});
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Debug middleware - log all requests
+app.use((req, res, next) => {
+  console.log(`📨 ${req.method} ${req.url}`);
+  next();
+});
+
+// ==================== HEALTH CHECK ====================
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    message: 'School Management API is running',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ==================== AUTH ENDPOINTS ====================
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const normalizedEmail = email.toLowerCase();
+    console.log('Login attempt for email:', normalizedEmail);
+
+    const user = await prisma.user.findUnique({
+      where: { email: normalizedEmail }
+    });
+
+    if (!user) {
+      console.log('User not found:', normalizedEmail);
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid email or password' 
+      });
+    }
+
+    if (user.password !== password) {
+      console.log('Invalid password for:', normalizedEmail);
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid email or password' 
+      });
+    }
+
+    const nameParts = user.name ? user.name.split(' ') : ['', ''];
+    const firstName = nameParts[0] || '';
+    const lastName = nameParts.slice(1).join(' ') || '';
+
+    const { password: _, ...userWithoutPassword } = user;
+    
+    const token = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+
+    console.log('Login successful for:', normalizedEmail);
+    
+    res.json({
+      success: true,
+      data: {
+        user: {
+          id: userWithoutPassword.id,
+          email: userWithoutPassword.email,
+          name: userWithoutPassword.name,
+          firstName: firstName,
+          lastName: lastName,
+          role: userWithoutPassword.role
+        },
+        token: token
+      }
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Login failed' 
+    });
+  }
+});
+
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'No token provided' 
+      });
+    }
+    
+    const token = authHeader.split(' ')[1];
+    
+    try {
+      const decoded = Buffer.from(token, 'base64').toString();
+      const userId = decoded.split(':')[0];
+      
+      const user = await prisma.user.findUnique({
+        where: { id: userId }
+      });
+      
+      if (!user) {
+        return res.status(404).json({ 
+          success: false, 
+          error: 'User not found' 
+        });
+      }
+      
+      const nameParts = user.name ? user.name.split(' ') : ['', ''];
+      const firstName = nameParts[0] || '';
+      const lastName = nameParts.slice(1).join(' ') || '';
+      
+      const { password, ...userWithoutPassword } = user;
+      
+      res.json({
+        success: true,
+        data: {
+          id: userWithoutPassword.id,
+          email: userWithoutPassword.email,
+          name: userWithoutPassword.name,
+          firstName: firstName,
+          lastName: lastName,
+          role: userWithoutPassword.role
+        }
+      });
+    } catch (decodeError) {
+      console.error('Token decode error:', decodeError);
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid token' 
+      });
+    }
+  } catch (error) {
+    console.error('Get me error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to get user data' 
+    });
+  }
+});
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, firstName, lastName, role, classIds, subjectIds } = req.body;
+    const normalizedEmail = email.toLowerCase();
+    console.log('📝 Registration attempt:', { email: normalizedEmail, firstName, lastName, role, classIds, subjectIds });
+    
+    const existingUser = await prisma.user.findUnique({
+      where: { email: normalizedEmail }
+    });
+    
+    if (existingUser) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'User already exists' 
+      });
+    }
+    
+    const user = await prisma.user.create({
+      data: {
+        email: normalizedEmail,
+        password,
+        name: `${firstName} ${lastName}`,
+        role: role
+      }
+    });
+    
+    console.log('✅ User created:', user.id, user.email);
+    
+    if (role === 'TEACHER') {
+      console.log('👨‍🏫 Creating teacher profile...');
+      
+      const teacher = await prisma.teacher.create({
+        data: {
+          userId: user.id
+        }
+      });
+      
+      console.log('✅ Teacher profile created:', teacher.id);
+      
+      if (classIds && classIds.length > 0) {
+        console.log('🏫 Assigning to classes:', classIds);
+        
+        const existingClasses = await prisma.class.findMany({
+          where: { id: { in: classIds } }
+        });
+        
+        console.log(`Found ${existingClasses.length} out of ${classIds.length} classes`);
+        
+        if (existingClasses.length > 0) {
+          await prisma.teacher.update({
+            where: { id: teacher.id },
+            data: {
+              classes: {
+                connect: existingClasses.map(c => ({ id: c.id }))
+              }
+            }
+          });
+          
+          console.log(`✅ Connected teacher to ${existingClasses.length} classes: ${existingClasses.map(c => c.name).join(', ')}`);
+        } else {
+          console.log('⚠️ No valid classes found to assign');
+        }
+      }
+      
+      if (subjectIds && subjectIds.length > 0) {
+        console.log('📚 Assigning subjects:', subjectIds);
+        
+        const existingSubjects = await prisma.subject.findMany({
+          where: { id: { in: subjectIds } }
+        });
+        
+        console.log(`Found ${existingSubjects.length} out of ${subjectIds.length} subjects`);
+        
+        if (existingSubjects.length > 0) {
+          for (const subject of existingSubjects) {
+            await prisma.subject.update({
+              where: { id: subject.id },
+              data: { teacherId: teacher.id }
+            });
+            console.log(`  ✅ Assigned to subject: ${subject.name}`);
+          }
+          
+          await prisma.teacher.update({
+            where: { id: teacher.id },
+            data: {
+              subjects: {
+                connect: existingSubjects.map(s => ({ id: s.id }))
+              }
+            }
+          });
+          
+          console.log('✅ Subjects assigned successfully');
+        }
+      }
+      
+      console.log('✅ Teacher registration completed successfully');
+    }
+    
+    if (role === 'PARENT') {
+      console.log('👪 Creating parent profile...');
+      
+      await prisma.parent.create({
+        data: {
+          userId: user.id
+        }
+      });
+      console.log('✅ Parent profile created');
+    }
+    
+    const token = Buffer.from(`${user.id}:${Date.now()}`).toString('base64');
+    
+    const { password: _, ...userWithoutPassword } = user;
+    
+    console.log('✅ Registration successful for:', normalizedEmail);
+    
+    res.status(201).json({
+      success: true,
+      data: {
+        user: userWithoutPassword,
+        token: token
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Registration error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Registration failed: ' + error.message 
+    });
+  }
+});
+
+// ==================== USER ENDPOINTS ====================
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        createdAt: true
+      }
+    });
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/users/role/:role', async (req, res) => {
+  try {
+    const { role } = req.params;
+    const users = await prisma.user.findMany({
+      where: { role },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        createdAt: true
+      }
+    });
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== CLASS ENDPOINTS ====================
+app.get('/api/classes', async (req, res) => {
+  try {
+    console.log('📚 GET /api/classes - Fetching all classes');
+    const classes = await prisma.class.findMany({
+      include: {
+        teacher: {
+          include: {
+            user: true
+          }
+        },
+        students: {
+          include: {
+            user: true
+          }
+        },
+        _count: {
+          select: { students: true }
+        }
+      }
+    });
+    console.log(`✅ Found ${classes.length} classes`);
+    res.json(classes);
+  } catch (error) {
+    console.error('❌ Error fetching classes:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/classes/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const classData = await prisma.class.findUnique({
+      where: { id },
+      include: {
+        teacher: {
+          include: {
+            user: true
+          }
+        },
+        students: {
+          include: {
+            user: true
+          }
+        },
+        subjects: true
+      }
+    });
+    res.json(classData);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/classes', async (req, res) => {
+  try {
+    const { name, section, classTeacherId } = req.body;
+    console.log('Creating class with data from frontend:', { name, section, classTeacherId });
+    
+    let grade = 0;
+    
+    if (name.includes('JSS 1')) grade = 7;
+    else if (name.includes('JSS 2')) grade = 8;
+    else if (name.includes('JSS 3')) grade = 9;
+    else if (name.includes('SSS 1')) grade = 10;
+    else if (name.includes('SSS 2')) grade = 11;
+    else if (name.includes('SSS 3')) grade = 12;
+    else {
+      const numberMatch = name.match(/\d+/);
+      grade = numberMatch ? parseInt(numberMatch[0]) : 1;
+    }
+    
+    const fullClassName = section && section !== 'General' 
+      ? `${name} ${section}` 
+      : name;
+    
+    const existingClass = await prisma.class.findFirst({
+      where: { name: fullClassName }
+    });
+    
+    if (existingClass) {
+      console.log('Class already exists:', existingClass);
+      return res.status(400).json({ 
+        error: 'Class with this name already exists',
+        existingClass 
+      });
+    }
+    
+    const newClass = await prisma.class.create({
+      data: {
+        name: fullClassName,
+        grade: grade,
+        teacherId: classTeacherId
+      },
+      include: {
+        teacher: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+    
+    console.log('Class created successfully:', newClass);
+    res.status(201).json(newClass);
+  } catch (error) {
+    console.error('Error creating class:', error);
+    
+    if (error.code === 'P2002') {
+      return res.status(400).json({ 
+        error: 'A class with this name already exists' 
+      });
+    }
+    
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/classes/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, grade, teacherId } = req.body;
+    
+    const updatedClass = await prisma.class.update({
+      where: { id },
+      data: {
+        name,
+        grade: parseInt(grade),
+        teacherId
+      },
+      include: {
+        teacher: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+    
+    res.json(updatedClass);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/classes/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🗑️ Deleting class:', id);
+    
+    const classWithRelations = await prisma.class.findUnique({
+      where: { id },
+      include: { 
+        students: true,
+        subjects: true,
+        attendances: true 
+      }
+    });
+    
+    if (!classWithRelations) {
+      return res.status(404).json({ error: 'Class not found' });
+    }
+    
+    if (classWithRelations.students.length > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot delete class with students. Remove students first or reassign them.' 
+      });
+    }
+    
+    await prisma.$transaction([
+      prisma.subjectClass.deleteMany({
+        where: { classId: id }
+      }),
+      prisma.attendance.deleteMany({
+        where: { classId: id }
+      }),
+      prisma.class.delete({
+        where: { id }
+      })
+    ]);
+    
+    console.log('✅ Class deleted successfully:', id);
+    res.json({ message: 'Class deleted successfully' });
+  } catch (error) {
+    console.error('❌ Error deleting class:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== TEACHER ENDPOINTS ====================
+app.get('/api/teachers', async (req, res) => {
+  try {
+    console.log('📚 Fetching teachers from API...');
+    
+    const teachers = await prisma.teacher.findMany({
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true
+          }
+        },
+        subjects: {
+          include: {
+            classes: {
+              include: {
+                class: true
+              }
+            }
+          }
+        },
+        classes: true
+      }
+    });
+    
+    console.log(`✅ Found ${teachers.length} teachers`);
+    
+    const formattedTeachers = teachers.map(teacher => {
+      const teacherName = teacher.user?.name || 'Unknown';
+      const teacherEmail = teacher.user?.email || 'No email';
+      
+      const subjectsWithClasses = teacher.subjects.map(subject => ({
+        id: subject.id,
+        name: subject.name,
+        className: subject.classes[0]?.class?.name || 'No Class'
+      }));
+      
+      const assignedClasses = teacher.classes.map(cls => ({
+        id: cls.id,
+        name: cls.name
+      }));
+      
+      return {
+        id: teacher.id,
+        userId: teacher.userId,
+        name: teacherName,
+        email: teacherEmail,
+        subjects: subjectsWithClasses,
+        classes: assignedClasses,
+        createdAt: teacher.createdAt,
+        updatedAt: teacher.updatedAt
+      };
+    });
+    
+    console.log('📊 Formatted teachers:', formattedTeachers.map(t => ({ id: t.id, name: t.name, classes: t.classes.length, subjects: t.subjects.length })));
+    
+    res.json(formattedTeachers);
+    
+  } catch (error) {
+    console.error('❌ Error fetching teachers:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch teachers',
+      message: error.message 
+    });
+  }
+});
+
+// Get teacher by user ID
+app.get('/api/teachers/user/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    console.log('👤 Fetching teacher by user ID:', userId);
+    
+    const teacher = await prisma.teacher.findUnique({
+      where: { userId: userId },
+      include: {
+        user: true,
+        classes: true,
+        subjects: true
+      }
+    });
+    
+    if (!teacher) {
+      console.log('❌ No teacher found for user ID:', userId);
+      return res.status(404).json({ error: 'Teacher not found' });
+    }
+    
+    console.log('✅ Teacher found:', teacher.user?.name);
+    res.json(teacher);
+  } catch (error) {
+    console.error('Error fetching teacher by user ID:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/teachers/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`📚 Fetching teacher with ID: ${id}`);
+    
+    const teacher = await prisma.teacher.findUnique({
+      where: { id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            role: true
+          }
+        },
+        subjects: {
+          include: {
+            classes: {
+              include: {
+                class: true
+              }
+            }
+          }
+        },
+        classes: true
+      }
+    });
+    
+    if (!teacher) {
+      return res.status(404).json({ error: 'Teacher not found' });
+    }
+    
+    const formattedTeacher = {
+      id: teacher.id,
+      userId: teacher.userId,
+      name: teacher.user?.name || 'Unknown',
+      email: teacher.user?.email || 'No email',
+      subjects: teacher.subjects.map(subject => ({
+        id: subject.id,
+        name: subject.name,
+        className: subject.classes[0]?.class?.name || 'No Class'
+      })),
+      classes: teacher.classes.map(cls => ({
+        id: cls.id,
+        name: cls.name
+      })),
+      createdAt: teacher.createdAt,
+      updatedAt: teacher.updatedAt
+    };
+    
+    res.json(formattedTeacher);
+    
+  } catch (error) {
+    console.error('❌ Error fetching teacher:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch teacher',
+      message: error.message 
+    });
+  }
+});
+
+app.post('/api/teachers', async (req, res) => {
+  try {
+    const { email, classIds, subjectIds } = req.body;
+    console.log('📝 Creating teacher with data:', { email, classIds, subjectIds });
+    
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    
+    let user = await prisma.user.findUnique({
+      where: { email }
+    });
+    
+    if (!user) {
+      user = await prisma.user.create({
+        data: {
+          email,
+          password: 'teacher123',
+          name: email.split('@')[0],
+          role: 'TEACHER'
+        }
+      });
+      console.log('✅ Created user for teacher:', user.email);
+    } else if (user.role !== 'TEACHER') {
+      user = await prisma.user.update({
+        where: { id: user.id },
+        data: { role: 'TEACHER' }
+      });
+    }
+    
+    const teacher = await prisma.teacher.create({
+      data: {
+        userId: user.id
+      },
+      include: {
+        user: true
+      }
+    });
+    
+    if (classIds && classIds.length > 0) {
+      await prisma.teacher.update({
+        where: { id: teacher.id },
+        data: {
+          classes: {
+            connect: classIds.map(id => ({ id }))
+          }
+        }
+      });
+    }
+    
+    if (subjectIds && subjectIds.length > 0) {
+      await prisma.teacher.update({
+        where: { id: teacher.id },
+        data: {
+          subjects: {
+            connect: subjectIds.map(id => ({ id }))
+          }
+        }
+      });
+    }
+    
+    const completeTeacher = await prisma.teacher.findUnique({
+      where: { id: teacher.id },
+      include: {
+        user: true,
+        classes: true,
+        subjects: true
+      }
+    });
+    
+    console.log('✅ Teacher created successfully:', completeTeacher.user?.email);
+    res.status(201).json(completeTeacher);
+    
+  } catch (error) {
+    console.error('❌ Error creating teacher:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/teachers/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🗑️ Deleting teacher:', id);
+    
+    const teacher = await prisma.teacher.findUnique({
+      where: { id },
+      include: { 
+        user: true,
+        subjects: true,
+        classes: true 
+      }
+    });
+    
+    if (!teacher) {
+      return res.status(404).json({ error: 'Teacher not found' });
+    }
+    
+    if (teacher.subjects.length > 0) {
+      console.log(`📚 Removing teacher from ${teacher.subjects.length} subjects...`);
+      await prisma.subject.updateMany({
+        where: { teacherId: teacher.id },
+        data: { teacherId: null }
+      });
+    }
+    
+    if (teacher.classes.length > 0) {
+      console.log(`🏫 Removing teacher from ${teacher.classes.length} classes...`);
+      await prisma.class.updateMany({
+        where: { teacherId: teacher.id },
+        data: { teacherId: null }
+      });
+    }
+    
+    await prisma.teacher.delete({
+      where: { id: teacher.id }
+    });
+    
+    await prisma.user.delete({
+      where: { id: teacher.userId }
+    });
+    
+    console.log('✅ Teacher deleted successfully:', id);
+    res.json({ 
+      success: true,
+      message: 'Teacher deleted successfully' 
+    });
+    
+  } catch (error) {
+    console.error('❌ Error deleting teacher:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete teacher',
+      message: error.message 
+    });
+  }
+});
+
+// ==================== STUDENT ENDPOINTS ====================
+app.get('/api/students', async (req, res) => {
+  try {
+    const { classId, teacherId } = req.query;
+    const where = {};
+    
+    if (classId) {
+      where.classId = classId;
+    }
+    
+    if (teacherId) {
+      const teacher = await prisma.teacher.findUnique({
+        where: { id: teacherId },
+        include: { classes: true }
+      });
+      
+      if (teacher && teacher.classes.length > 0) {
+        const classIds = teacher.classes.map(c => c.id);
+        where.classId = { in: classIds };
+      } else {
+        return res.json([]);
+      }
+    }
+    
+    const students = await prisma.student.findMany({
+      where,
+      include: {
+        user: {
+          select: {
+            name: true,
+            email: true
+          }
+        },
+        class: true,
+        parent: {
+          include: {
+            user: true
+          }
+        },
+        attendances: true,
+        grades: {
+          include: {
+            subject: true
+          }
+        }
+      }
+    });
+    
+    const transformedStudents = students.map(function(student) {
+      return {
+        id: student.id,
+        firstName: student.user?.name?.split(' ')[0] || '',
+        lastName: student.user?.name?.split(' ').slice(1).join(' ') || '',
+        email: student.user?.email || '',
+        admissionNo: student.admissionNo || 'N/A',
+        class: student.class,
+        parent: student.parent ? {
+          id: student.parent.id,
+          firstName: student.parent.user?.name?.split(' ')[0] || '',
+          lastName: student.parent.user?.name?.split(' ').slice(1).join(' ') || ''
+        } : null,
+        gender: student.gender,
+        dob: student.dob,
+        enrollmentDate: student.createdAt,
+        user: student.user
+      };
+    });
+    
+    res.json(transformedStudents);
+  } catch (error) {
+    console.error('Error fetching students:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/students/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const student = await prisma.student.findUnique({
+      where: { id },
+      include: {
+        user: {
+          select: {
+            name: true,
+            email: true
+          }
+        },
+        class: true,
+        parent: {
+          include: {
+            user: true
+          }
+        },
+        attendances: true,
+        grades: {
+          include: {
+            subject: true
+          }
+        }
+      }
+    });
+    
+    const transformedStudent = {
+      id: student.id,
+      firstName: student.user?.name?.split(' ')[0] || '',
+      lastName: student.user?.name?.split(' ').slice(1).join(' ') || '',
+      email: student.user?.email || '',
+      admissionNo: student.admissionNo || 'N/A',
+      class: student.class,
+      parent: student.parent ? {
+        id: student.parent.id,
+        firstName: student.parent.user?.name?.split(' ')[0] || '',
+        lastName: student.parent.user?.name?.split(' ').slice(1).join(' ') || ''
+      } : null,
+      gender: student.gender,
+      dob: student.dob,
+      enrollmentDate: student.createdAt,
+      user: student.user
+    };
+    
+    res.json(transformedStudent);
+  } catch (error) {
+    console.error('Error fetching student:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/students', async (req, res) => {
+  try {
+    const { firstName, lastName, email, password, admissionNo, classId, parentId, gender, dob } = req.body;
+    console.log('📝 Creating student with data:', { firstName, lastName, email, admissionNo, classId, parentId, gender, dob });
+    
+    let finalEmail = email;
+    let finalPassword = password;
+    
+    if (!finalEmail) {
+      const baseEmail = `${firstName.toLowerCase()}.${lastName.toLowerCase()}@school.edu`;
+      let existingUser = await prisma.user.findUnique({
+        where: { email: baseEmail }
+      });
+      
+      if (existingUser) {
+        finalEmail = `${firstName.toLowerCase()}.${lastName.toLowerCase()}${Math.floor(Math.random() * 1000)}@school.edu`;
+      } else {
+        finalEmail = baseEmail;
+      }
+    }
+    
+    if (!finalPassword) {
+      finalPassword = 'student123';
+    }
+    
+    const user = await prisma.user.create({
+      data: {
+        email: finalEmail,
+        password: finalPassword,
+        name: `${firstName} ${lastName}`,
+        role: 'STUDENT'
+      }
+    });
+    
+    let finalAdmissionNo = admissionNo;
+    if (!finalAdmissionNo) {
+      const studentCount = await prisma.student.count();
+      const year = new Date().getFullYear().toString().slice(-2);
+      finalAdmissionNo = `STU${year}${String(studentCount + 1).padStart(4, '0')}`;
+    }
+    
+    const student = await prisma.student.create({
+      data: {
+        userId: user.id,
+        classId,
+        parentId: parentId || null,
+        admissionNo: finalAdmissionNo,
+        gender: gender || null,
+        dob: dob ? new Date(dob) : null
+      },
+      include: {
+        user: {
+          select: {
+            name: true,
+            email: true
+          }
+        },
+        class: true,
+        parent: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+    
+    const transformedStudent = {
+      id: student.id,
+      firstName: student.user?.name?.split(' ')[0] || firstName,
+      lastName: student.user?.name?.split(' ').slice(1).join(' ') || lastName,
+      email: student.user?.email || finalEmail,
+      admissionNo: student.admissionNo || finalAdmissionNo,
+      class: student.class,
+      parent: student.parent ? {
+        id: student.parent.id,
+        firstName: student.parent.user?.name?.split(' ')[0] || '',
+        lastName: student.parent.user?.name?.split(' ').slice(1).join(' ') || ''
+      } : null,
+      gender: student.gender,
+      dob: student.dob,
+      enrollmentDate: student.createdAt,
+      user: student.user
+    };
+    
+    console.log('✅ Student created successfully:', transformedStudent);
+    res.status(201).json(transformedStudent);
+  } catch (error) {
+    console.error('❌ Error creating student:', error);
+    
+    if (error.code === 'P2002') {
+      return res.status(400).json({ 
+        error: 'A student with this email or admission number already exists' 
+      });
+    }
+    
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/students/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { classId, parentId } = req.body;
+    
+    const student = await prisma.student.update({
+      where: { id },
+      data: {
+        classId,
+        parentId
+      },
+      include: {
+        user: {
+          select: {
+            name: true,
+            email: true
+          }
+        },
+        class: true,
+        parent: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+    
+    res.json(student);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/students/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🗑️ Deleting student:', id);
+    
+    const student = await prisma.student.findUnique({
+      where: { id },
+      include: { user: true }
+    });
+    
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+    
+    console.log('📊 Student: ' + (student.user?.name || 'Unknown'));
+    
+    const fees = await prisma.fee.findMany({
+      where: { studentId: id },
+      select: { id: true }
+    });
+    
+    console.log('💰 Found ' + fees.length + ' fees');
+    
+    for (const fee of fees) {
+      await prisma.$executeRaw`DELETE FROM "Payment" WHERE "feeId" = ${fee.id}`;
+    }
+    
+    for (const fee of fees) {
+      await prisma.$executeRaw`DELETE FROM "FeeItem" WHERE "feeId" = ${fee.id}`;
+    }
+    
+    for (const fee of fees) {
+      await prisma.$executeRaw`DELETE FROM "Discount" WHERE "feeId" = ${fee.id}`;
+    }
+    
+    await prisma.$executeRaw`DELETE FROM "Fee" WHERE "studentId" = ${id}`;
+    await prisma.$executeRaw`DELETE FROM "Attendance" WHERE "studentId" = ${id}`;
+    await prisma.$executeRaw`DELETE FROM "Grade" WHERE "studentId" = ${id}`;
+    await prisma.$executeRaw`DELETE FROM "Student" WHERE id = ${id}`;
+    await prisma.$executeRaw`DELETE FROM "User" WHERE id = ${student.userId}`;
+    
+    console.log('✅ Student deleted successfully');
+    res.json({ message: 'Student deleted successfully' });
+    
+  } catch (error) {
+    console.error('❌ Error deleting student:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete student',
+      details: error.message 
+    });
+  }
+});
+
+// Add endpoint to get students by teacher ID
+app.get('/api/teachers/:teacherId/students', async (req, res) => {
+  try {
+    const { teacherId } = req.params;
+    
+    const teacher = await prisma.teacher.findUnique({
+      where: { id: teacherId },
+      include: { classes: true }
+    });
+    
+    if (!teacher) {
+      return res.status(404).json({ error: 'Teacher not found' });
+    }
+    
+    if (teacher.classes.length === 0) {
+      return res.json([]);
+    }
+    
+    const classIds = teacher.classes.map(c => c.id);
+    
+    const students = await prisma.student.findMany({
+      where: {
+        classId: { in: classIds }
+      },
+      include: {
+        user: {
+          select: {
+            name: true,
+            email: true
+          }
+        },
+        class: true
+      },
+      orderBy: {
+        user: {
+          name: 'asc'
+        }
+      }
+    });
+    
+    const transformedStudents = students.map(student => ({
+      id: student.id,
+      name: student.user?.name || 'Unknown',
+      firstName: student.user?.name?.split(' ')[0] || '',
+      lastName: student.user?.name?.split(' ').slice(1).join(' ') || '',
+      email: student.user?.email || '',
+      admissionNo: student.admissionNo || 'N/A',
+      className: student.class?.name || 'No Class'
+    }));
+    
+    res.json(transformedStudents);
+  } catch (error) {
+    console.error('Error fetching teacher students:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== EXCEL IMPORT ENDPOINTS ====================
+
+function getValue(row, possibleKeys) {
+  for (const key of possibleKeys) {
+    if (row[key] !== undefined && row[key] !== null && row[key] !== '') {
+      return row[key];
+    }
+  }
+  return null;
+}
+
+app.post('/api/students/import-excel', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    console.log(`📊 Reading Excel file: ${req.file.originalname}`);
+    
+    const workbook = XLSX.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_json(worksheet);
+    
+    console.log(`📊 Found ${data.length} rows in Excel file`);
+    console.log(`📊 Columns found: ${Object.keys(data[0] || {}).join(', ')}`);
+    
+    const results = {
+      success: [],
+      errors: [],
+      total: data.length
+    };
+    
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      try {
+        const firstName = getValue(row, ['FirstName', 'First Name', 'Firstname', 'first_name']);
+        const lastName = getValue(row, ['LastName', 'Last Name', 'Lastname', 'last_name', 'Sur Name', 'Surname']);
+        const email = getValue(row, ['Email', 'Email Address', 'email_address']);
+        const admissionNo = getValue(row, ['AdmissionNo', 'Admission Number', 'Admission No', 'Student ID']);
+        const className = getValue(row, ['ClassName', 'Class Name', 'Class', 'class_name']);
+        const gender = getValue(row, ['Gender', 'Sex', 'gender']);
+        const dob = getValue(row, ['DOB', 'Date of Birth', 'Birth Date']);
+        
+        if (!firstName || !lastName || !admissionNo || !className) {
+          results.errors.push({ row: i + 2, data: row, error: 'Missing required fields' });
+          continue;
+        }
+        
+        let normalizedClassName = className.toString().toUpperCase();
+        if (normalizedClassName === 'JSS1') normalizedClassName = 'JSS 1';
+        else if (normalizedClassName === 'JSS2') normalizedClassName = 'JSS 2';
+        else if (normalizedClassName === 'JSS3') normalizedClassName = 'JSS 3';
+        else if (normalizedClassName === 'SSS1') normalizedClassName = 'SSS 1';
+        else if (normalizedClassName === 'SSS2') normalizedClassName = 'SSS 2';
+        else if (normalizedClassName === 'SSS3') normalizedClassName = 'SSS 3';
+        
+        const class_ = await prisma.class.findFirst({
+          where: { name: { contains: normalizedClassName, mode: 'insensitive' } }
+        });
+        
+        if (!class_) {
+          results.errors.push({ row: i + 2, data: row, error: `Class not found: ${className}` });
+          continue;
+        }
+        
+        const finalEmail = email || `${firstName.toLowerCase()}.${lastName.toLowerCase()}@school.edu`;
+        const existingUser = await prisma.user.findUnique({ where: { email: finalEmail } });
+        if (existingUser) {
+          results.errors.push({ row: i + 2, data: row, error: `Email already exists: ${finalEmail}` });
+          continue;
+        }
+        
+        const user = await prisma.user.create({
+          data: {
+            email: finalEmail,
+            password: 'student123',
+            name: `${firstName} ${lastName}`,
+            role: 'STUDENT'
+          }
+        });
+        
+        await prisma.student.create({
+          data: {
+            userId: user.id,
+            classId: class_.id,
+            admissionNo: admissionNo.toString().trim(),
+            gender: gender || null,
+            dob: dob ? new Date(dob) : null
+          }
+        });
+        
+        results.success.push({
+          row: i + 2,
+          name: `${firstName} ${lastName}`,
+          admissionNo: admissionNo,
+          email: finalEmail,
+          password: 'student123',
+          className: class_.name
+        });
+        
+      } catch (error) {
+        results.errors.push({ row: i + 2, data: row, error: error.message });
+      }
+    }
+    
+    fs.unlinkSync(req.file.path);
+    res.json({ message: 'Import completed', results });
+    
+  } catch (error) {
+    console.error('Error importing students:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/students/import-excel-custom', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    const workbook = XLSX.readFile(req.file.path);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+    const rows = data.slice(1);
+    
+    const results = { success: [], errors: [], total: rows.length };
+    
+    const allClasses = await prisma.class.findMany();
+    const classMap = {};
+    allClasses.forEach(c => { classMap[c.name.toUpperCase()] = c; });
+    
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (!row[0] || !row[1] || !row[2]) continue;
+      
+      try {
+        const admissionNo = row[0]?.toString().trim();
+        const surName = row[1]?.toString().trim();
+        const firstName = row[2]?.toString().trim();
+        const otherName = row[3]?.toString().trim() || '';
+        const gender = row[4]?.toString().trim() || '';
+        const className = row[5]?.toString().trim();
+        
+        const fullName = `${firstName} ${surName}${otherName ? ' ' + otherName : ''}`;
+        
+        if (!admissionNo || !firstName || !surName || !className) {
+          results.errors.push({ row: i + 2, data: { admissionNo, firstName, surName, className }, error: 'Missing required fields' });
+          continue;
+        }
+        
+        let normalizedClassName = className.toUpperCase();
+        if (normalizedClassName === 'JSS1') normalizedClassName = 'JSS 1';
+        else if (normalizedClassName === 'JSS2') normalizedClassName = 'JSS 2';
+        else if (normalizedClassName === 'JSS3') normalizedClassName = 'JSS 3';
+        else if (normalizedClassName === 'SSS1') normalizedClassName = 'SSS 1';
+        else if (normalizedClassName === 'SSS2') normalizedClassName = 'SSS 2';
+        else if (normalizedClassName === 'SSS3') normalizedClassName = 'SSS 3';
+        
+        const class_ = classMap[normalizedClassName];
+        if (!class_) {
+          results.errors.push({ row: i + 2, data: { admissionNo, className }, error: `Class not found: ${className}` });
+          continue;
+        }
+        
+        const existingStudent = await prisma.student.findFirst({ where: { admissionNo } });
+        if (existingStudent) {
+          results.errors.push({ row: i + 2, data: { admissionNo, fullName }, error: `Student with admission number ${admissionNo} already exists` });
+          continue;
+        }
+        
+        const email = `${firstName.toLowerCase()}.${surName.toLowerCase()}${otherName ? '.' + otherName.toLowerCase() : ''}@school.edu`;
+        const finalEmail = await prisma.user.findUnique({ where: { email } }) 
+          ? `${firstName.toLowerCase()}.${surName.toLowerCase()}${Date.now()}@school.edu` 
+          : email;
+        
+        const user = await prisma.user.create({
+          data: {
+            email: finalEmail,
+            password: 'student123',
+            name: fullName,
+            role: 'STUDENT'
+          }
+        });
+        
+        await prisma.student.create({
+          data: {
+            userId: user.id,
+            classId: class_.id,
+            admissionNo: admissionNo,
+            gender: gender.toUpperCase() === 'MALE' ? 'Male' : gender.toUpperCase() === 'FEMALE' ? 'Female' : null
+          }
+        });
+        
+        results.success.push({
+          row: i + 2,
+          admissionNo: admissionNo,
+          name: fullName,
+          email: finalEmail,
+          password: 'student123',
+          className: class_.name,
+          gender: gender
+        });
+        
+      } catch (error) {
+        results.errors.push({ row: i + 2, data: { admissionNo: row[0], name: `${row[2]} ${row[1]}` }, error: error.message });
+      }
+    }
+    
+    fs.unlinkSync(req.file.path);
+    res.json({ message: 'Import completed', results });
+    
+  } catch (error) {
+    console.error('Error importing students:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/students/import-template', (req, res) => {
+  try {
+    const templateData = [
+      { 'FirstName': 'John', 'LastName': 'Doe', 'Email': 'john.doe@example.com', 'AdmissionNo': 'STU240001', 'ClassName': 'JSS 1', 'Gender': 'Male', 'DOB': '2010-05-15', 'ParentEmail': 'parent@example.com' },
+      { 'FirstName': 'Jane', 'LastName': 'Smith', 'Email': '', 'AdmissionNo': 'STU240002', 'ClassName': 'JSS 2', 'Gender': 'Female', 'DOB': '2009-08-20', 'ParentEmail': '' }
+    ];
+    
+    const worksheet = XLSX.utils.json_to_sheet(templateData);
+    worksheet['!cols'] = [{ wch: 15 }, { wch: 15 }, { wch: 25 }, { wch: 15 }, { wch: 15 }, { wch: 10 }, { wch: 12 }, { wch: 25 }];
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Students');
+    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=student_import_template.xlsx');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error generating template:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== SUBJECT ENDPOINTS ====================
+app.get('/api/subjects', async (req, res) => {
+  try {
+    const subjects = await prisma.subject.findMany({
+      include: {
+        teacher: { include: { user: true } },
+        classes: { include: { class: true } },
+        grades: true
+      }
+    });
+    
+    const transformedSubjects = subjects.map(subject => ({
+      ...subject,
+      classes: subject.classes.map(sc => sc.class)
+    }));
+    res.json(transformedSubjects);
+  } catch (error) {
+    console.error('Error fetching subjects:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/subjects/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const subject = await prisma.subject.findUnique({
+      where: { id },
+      include: {
+        teacher: { include: { user: true } },
+        classes: { include: { class: true } },
+        grades: true
+      }
+    });
+    if (!subject) return res.status(404).json({ error: 'Subject not found' });
+    res.json({ ...subject, classes: subject.classes.map(sc => sc.class) });
+  } catch (error) {
+    console.error('Error fetching subject:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/subjects', async (req, res) => {
+  try {
+    const { name, classIds, teacherId } = req.body;
+    if (!name || !classIds || !Array.isArray(classIds) || classIds.length === 0) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    const existingSubject = await prisma.subject.findFirst({ where: { name, teacherId: teacherId || null } });
+    if (existingSubject) {
+      return res.status(400).json({ error: 'Subject already exists for this teacher' });
+    }
+    
+    const subject = await prisma.subject.create({
+      data: {
+        name,
+        teacherId: teacherId || null,
+        classes: { create: classIds.map(classId => ({ class: { connect: { id: classId } } })) }
+      },
+      include: {
+        teacher: { include: { user: true } },
+        classes: { include: { class: true } }
+      }
+    });
+    
+    res.status(201).json({ ...subject, classes: subject.classes.map(sc => sc.class) });
+  } catch (error) {
+    console.error('Error creating subject:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/subjects/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, classIds, teacherId } = req.body;
+    
+    await prisma.subjectClass.deleteMany({ where: { subjectId: id } });
+    
+    const subject = await prisma.subject.update({
+      where: { id },
+      data: {
+        name,
+        teacherId: teacherId || null,
+        classes: { create: classIds?.map(classId => ({ class: { connect: { id: classId } } })) || [] }
+      },
+      include: {
+        teacher: { include: { user: true } },
+        classes: { include: { class: true } }
+      }
+    });
+    
+    res.json({ ...subject, classes: subject.classes.map(sc => sc.class) });
+  } catch (error) {
+    console.error('Error updating subject:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/subjects/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const subjectWithGrades = await prisma.subject.findUnique({ where: { id }, include: { grades: true } });
+    if (subjectWithGrades?.grades.length > 0) {
+      return res.status(400).json({ error: 'Cannot delete subject with existing grades' });
+    }
+    
+    await prisma.$transaction([
+      prisma.subjectClass.deleteMany({ where: { subjectId: id } }),
+      prisma.subject.delete({ where: { id } })
+    ]);
+    
+    res.json({ message: 'Subject deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting subject:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== PARENT ENDPOINTS ====================
+app.get('/api/parents', async (req, res) => {
+  try {
+    const parents = await prisma.parent.findMany({
+      include: {
+        user: { select: { name: true, email: true } },
+        students: { include: { user: true, class: true } }
+      }
+    });
+    res.json(parents);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/parents', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const parent = await prisma.parent.create({ data: { userId }, include: { user: { select: { name: true, email: true } } } });
+    res.status(201).json(parent);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== PARENT CHILD LINKING ENDPOINTS ====================
+app.get('/api/parent/available-students', async (req, res) => {
+  try {
+    const { search } = req.query;
+    const where = { parentId: null };
+    if (search && search.trim()) {
+      where.OR = [
+        { user: { name: { contains: search, mode: 'insensitive' } } },
+        { admissionNo: { contains: search, mode: 'insensitive' } }
+      ];
+    }
+    
+    const students = await prisma.student.findMany({
+      where,
+      include: { user: true, class: true },
+      orderBy: { user: { name: 'asc' } }
+    });
+    
+    res.json({ data: students.map(s => ({ id: s.id, name: s.user?.name, admissionNo: s.admissionNo, className: s.class?.name, classId: s.classId })) });
+  } catch (error) {
+    console.error('Error fetching available students:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/parent/link-child', async (req, res) => {
+  try {
+    const { studentId } = req.body;
+    if (!studentId) return res.status(400).json({ error: 'Student ID required' });
+    
+    const parentUser = await prisma.user.findFirst({ where: { role: 'PARENT' } });
+    if (!parentUser) return res.status(404).json({ error: 'Parent user not found' });
+    
+    const parent = await prisma.parent.findUnique({ where: { userId: parentUser.id } });
+    if (!parent) return res.status(404).json({ error: 'Parent profile not found' });
+    
+    const student = await prisma.student.findUnique({ where: { id: studentId }, include: { user: true, class: true } });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+    if (student.parentId) return res.status(400).json({ error: 'Student already has a parent' });
+    
+    const updatedStudent = await prisma.student.update({
+      where: { id: studentId },
+      data: { parentId: parent.id },
+      include: { user: true, class: true }
+    });
+    
+    res.json({ data: { id: updatedStudent.id, name: updatedStudent.user?.name, admissionNo: updatedStudent.admissionNo, className: updatedStudent.class?.name }, message: 'Child linked successfully' });
+  } catch (error) {
+    console.error('Error linking child:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/parent/unlink-child/:studentId', async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const parentUser = await prisma.user.findFirst({ where: { role: 'PARENT' } });
+    if (!parentUser) return res.status(404).json({ error: 'Parent user not found' });
+    
+    const parent = await prisma.parent.findUnique({ where: { userId: parentUser.id } });
+    if (!parent) return res.status(404).json({ error: 'Parent profile not found' });
+    
+    const student = await prisma.student.findUnique({ where: { id: studentId }, include: { user: true } });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+    if (student.parentId !== parent.id) return res.status(400).json({ error: 'Student not linked to your account' });
+    
+    await prisma.student.update({ where: { id: studentId }, data: { parentId: null } });
+    res.json({ message: 'Child unlinked successfully' });
+  } catch (error) {
+    console.error('Error unlinking child:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== ATTENDANCE ENDPOINTS ====================
+app.get('/api/attendance', async (req, res) => {
+  try {
+    const attendance = await prisma.attendance.findMany({
+      include: { student: { include: { user: true } }, class: true }
+    });
+    res.json(attendance);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/attendance', async (req, res) => {
+  try {
+    const { date, status, studentId, classId } = req.body;
+    const attendance = await prisma.attendance.create({
+      data: { date: new Date(date), status, studentId, classId },
+      include: { student: { include: { user: true } }, class: true }
+    });
+    res.status(201).json(attendance);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Add bulk attendance endpoint
+app.post('/api/attendance/bulk', async (req, res) => {
+  try {
+    const { date, attendances, classId } = req.body;
+    console.log('📝 Recording bulk attendance for date:', date);
+    
+    const results = [];
+    for (const att of attendances) {
+      const attendance = await prisma.attendance.upsert({
+        where: {
+          studentId_date: {
+            studentId: att.studentId,
+            date: new Date(date)
+          }
+        },
+        update: {
+          status: att.status
+        },
+        create: {
+          date: new Date(date),
+          status: att.status,
+          studentId: att.studentId,
+          classId: classId || null
+        }
+      });
+      results.push(attendance);
+    }
+    
+    console.log(`✅ Recorded ${results.length} attendance records`);
+    res.json({ data: results });
+  } catch (error) {
+    console.error('Error recording bulk attendance:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== GRADE ENDPOINTS ====================
+app.get('/api/grades', async (req, res) => {
+  try {
+    const grades = await prisma.grade.findMany({
+      include: { student: { include: { user: true } }, subject: true }
+    });
+    res.json(grades);
+  } catch (error) {
+    console.error('Error fetching grades:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/grades', async (req, res) => {
+  try {
+    const { 
+      score, 
+      type, 
+      studentId, 
+      subjectId, 
+      maxScore, 
+      remarks, 
+      percentage, 
+      gradeLetter, 
+      termId, 
+      category 
+    } = req.body;
+    
+    console.log('📝 Creating grade with data:', {
+      score,
+      type,
+      studentId,
+      subjectId,
+      maxScore,
+      category,
+      percentage,
+      termId
+    });
+    
+    // Validate required fields
+    if (!studentId) {
+      console.error('❌ Missing studentId');
+      return res.status(400).json({ 
+        success: false,
+        error: 'Student ID is required',
+        details: 'Missing studentId field'
+      });
+    }
+    
+    if (!subjectId) {
+      console.error('❌ Missing subjectId');
+      return res.status(400).json({ 
+        success: false,
+        error: 'Subject ID is required',
+        details: 'Missing subjectId field'
+      });
+    }
+    
+    if (score === undefined || score === null) {
+      console.error('❌ Missing score');
+      return res.status(400).json({ 
+        success: false,
+        error: 'Score is required',
+        details: 'Missing score field'
+      });
+    }
+    
+    // Check if student exists
+    const studentExists = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: {
+        user: true,
+        class: true
+      }
+    });
+    
+    if (!studentExists) {
+      console.error('❌ Student not found:', studentId);
+      return res.status(404).json({ 
+        success: false,
+        error: 'Student not found',
+        details: `No student found with ID: ${studentId}`
+      });
+    }
+    
+    console.log('✅ Student found:', {
+      id: studentExists.id,
+      name: studentExists.user?.name,
+      class: studentExists.class?.name
+    });
+    
+    // Check if subject exists
+    const subjectExists = await prisma.subject.findUnique({
+      where: { id: subjectId },
+      include: {
+        teacher: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+    
+    if (!subjectExists) {
+      console.error('❌ Subject not found:', subjectId);
+      return res.status(404).json({ 
+        success: false,
+        error: 'Subject not found',
+        details: `No subject found with ID: ${subjectId}`
+      });
+    }
+    
+    console.log('✅ Subject found:', {
+      id: subjectExists.id,
+      name: subjectExists.name,
+      teacher: subjectExists.teacher?.user?.name
+    });
+    
+    // Parse and validate scores
+    let finalScore = parseFloat(score);
+    let finalMaxScore = maxScore ? parseFloat(maxScore) : (type === 'EXAM' ? 60 : 40);
+    
+    if (isNaN(finalScore)) {
+      console.error('❌ Invalid score:', score);
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid score',
+        details: 'Score must be a valid number'
+      });
+    }
+    
+    if (finalScore < 0 || finalScore > finalMaxScore) {
+      console.error(`❌ Score out of range: ${finalScore} (max: ${finalMaxScore})`);
+      return res.status(400).json({ 
+        success: false,
+        error: 'Score out of range',
+        details: `Score must be between 0 and ${finalMaxScore}`
+      });
+    }
+    
+    let finalPercentage = percentage ? parseFloat(percentage) : null;
+    let finalGrade = gradeLetter;
+    
+    // Calculate percentage if not provided
+    if (!finalPercentage && finalScore) {
+      finalPercentage = (finalScore / finalMaxScore) * 100;
+    }
+    
+    // Calculate grade letter if not provided
+    if (!finalGrade && finalPercentage) {
+      if (finalPercentage >= 70) finalGrade = 'A';
+      else if (finalPercentage >= 60) finalGrade = 'B';
+      else if (finalPercentage >= 50) finalGrade = 'C';
+      else if (finalPercentage >= 45) finalGrade = 'D';
+      else if (finalPercentage >= 40) finalGrade = 'E';
+      else finalGrade = 'F';
+    }
+    
+    // Determine category if not provided
+    let finalCategory = category;
+    if (!finalCategory) {
+      finalCategory = type === 'EXAM' ? 'EXAM' : 'CA';
+    }
+    
+    let finalType = type;
+    if (!finalType) {
+      finalType = finalCategory === 'EXAM' ? 'EXAM' : 'CA';
+    }
+    
+    console.log('📊 Calculated values:', {
+      finalScore,
+      finalMaxScore,
+      finalPercentage: finalPercentage?.toFixed(2),
+      finalGrade,
+      finalType,
+      finalCategory
+    });
+    
+    // Check if grade already exists for this student, subject, and term
+    const existingGrade = await prisma.grade.findFirst({
+      where: {
+        studentId: studentId,
+        subjectId: subjectId,
+        type: finalType,
+        termId: termId || null
+      }
+    });
+    
+    if (existingGrade) {
+      console.log('⚠️ Grade already exists, updating instead...');
+      
+      const updatedGrade = await prisma.grade.update({
+        where: { id: existingGrade.id },
+        data: {
+          score: finalScore,
+          percentage: finalPercentage,
+          gradeLetter: finalGrade,
+          maxScore: finalMaxScore,
+          remarks: remarks || null,
+          updatedAt: new Date()
+        },
+        include: {
+          student: {
+            include: {
+              user: true,
+              class: true
+            }
+          },
+          subject: true
+        }
+      });
+      
+      console.log('✅ Grade updated successfully:', updatedGrade.id);
+      
+      return res.status(200).json({
+        success: true,
+        data: updatedGrade,
+        message: `${finalType} grade updated successfully`
+      });
+    }
+    
+    // Create new grade
+    const grade = await prisma.grade.create({
+      data: {
+        score: finalScore,
+        percentage: finalPercentage,
+        gradeLetter: finalGrade,
+        type: finalType,
+        category: finalCategory,
+        studentId: studentId,
+        subjectId: subjectId,
+        maxScore: finalMaxScore,
+        remarks: remarks || null,
+        termId: termId || null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      include: {
+        student: {
+          include: {
+            user: true,
+            class: true
+          }
+        },
+        subject: true
+      }
+    });
+    
+    console.log('✅ Grade created successfully:', grade.id);
+    
+    res.status(201).json({
+      success: true,
+      data: grade,
+      message: `${finalType} grade created successfully`
+    });
+    
+  } catch (error) {
+    console.error('❌ Error creating grade:');
+    console.error('Error name:', error.name);
+    console.error('Error message:', error.message);
+    console.error('Error code:', error.code);
+    console.error('Full error:', error);
+    
+    // Handle specific Prisma errors
+    if (error.code === 'P2002') {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Grade already exists',
+        details: 'A grade record for this student, subject, and term already exists'
+      });
+    }
+    
+    if (error.code === 'P2003') {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Invalid foreign key',
+        details: 'The provided student ID or subject ID does not exist'
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to create grade',
+      details: error.message,
+      code: error.code
+    });
+  }
+});
+
+// Get grades with filtering
+app.get('/api/grades/filter', async (req, res) => {
+  try {
+    const { studentId, subjectId, type, teacherId, termId, category } = req.query;
+    const where = {};
+    
+    if (studentId) where.studentId = studentId;
+    if (subjectId) where.subjectId = subjectId;
+    if (type) where.type = type;
+    if (termId) where.termId = termId;
+    if (category) where.category = category;
+    if (teacherId) {
+      where.subject = { teacherId: teacherId };
+    }
+    
+    const grades = await prisma.grade.findMany({
+      where,
+      include: {
+        student: {
+          include: {
+            user: true,
+            class: true
+          }
+        },
+        subject: {
+          include: {
+            teacher: {
+              include: {
+                user: true
+              }
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    const formattedGrades = grades.map(grade => ({
+      id: grade.id,
+      score: grade.score,
+      percentage: grade.percentage,
+      gradeLetter: grade.gradeLetter,
+      type: grade.type,
+      category: grade.category,
+      maxScore: grade.maxScore,
+      remarks: grade.remarks,
+      createdAt: grade.createdAt,
+      student: {
+        id: grade.student.id,
+        name: grade.student.user?.name,
+        admissionNo: grade.student.admissionNo,
+        className: grade.student.class?.name
+      },
+      subject: {
+        id: grade.subject.id,
+        name: grade.subject.name,
+        teacher: grade.subject.teacher?.user?.name
+      }
+    }));
+    
+    res.json({ data: formattedGrades });
+  } catch (error) {
+    console.error('Error fetching filtered grades:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get grade summary for a student
+app.get('/api/grades/summary/:studentId', async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const { termId } = req.query;
+    
+    const where = { studentId };
+    if (termId) where.termId = termId;
+    
+    const grades = await prisma.grade.findMany({
+      where,
+      include: { subject: true }
+    });
+    
+    const summary = {
+      totalGrades: grades.length,
+      average: grades.length > 0 ? grades.reduce((sum, g) => sum + (g.percentage || g.score), 0) / grades.length : 0,
+      byType: {},
+      bySubject: {}
+    };
+    
+    grades.forEach(grade => {
+      if (!summary.byType[grade.type]) {
+        summary.byType[grade.type] = { count: 0, total: 0, average: 0 };
+      }
+      summary.byType[grade.type].count++;
+      summary.byType[grade.type].total += (grade.percentage || grade.score);
+      summary.byType[grade.type].average = summary.byType[grade.type].total / summary.byType[grade.type].count;
+      
+      if (!summary.bySubject[grade.subject.name]) {
+        summary.bySubject[grade.subject.name] = { count: 0, total: 0, average: 0, subjectId: grade.subjectId };
+      }
+      summary.bySubject[grade.subject.name].count++;
+      summary.bySubject[grade.subject.name].total += (grade.percentage || grade.score);
+      summary.bySubject[grade.subject.name].average = summary.bySubject[grade.subject.name].total / summary.bySubject[grade.subject.name].count;
+    });
+    
+    res.json({ data: summary });
+  } catch (error) {
+    console.error('Error fetching grade summary:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Calculate final grade for a student (CA 40% + Exam 60%)
+app.get('/api/grades/final/:studentId/:subjectId', async (req, res) => {
+  try {
+    const { studentId, subjectId } = req.params;
+    const { termId } = req.query;
+    
+    const where = { studentId, subjectId };
+    if (termId) where.termId = termId;
+    
+    const grades = await prisma.grade.findMany({
+      where,
+      include: { subject: true }
+    });
+    
+    // Separate CA and Exam grades
+    const caGrades = grades.filter(g => g.category === 'CA');
+    const examGrades = grades.filter(g => g.category === 'EXAM');
+    
+    // Calculate CA total (40% of total)
+    let caTotal = 0;
+    let caMaxTotal = 0;
+    caGrades.forEach(grade => {
+      caTotal += grade.score;
+      caMaxTotal += grade.maxScore;
+    });
+    const caPercentage = caMaxTotal > 0 ? (caTotal / caMaxTotal) * 40 : 0;
+    
+    // Calculate Exam score (60% of total)
+    let examScore = 0;
+    let examMax = 0;
+    examGrades.forEach(grade => {
+      examScore += grade.score;
+      examMax += grade.maxScore;
+    });
+    const examPercentage = examMax > 0 ? (examScore / examMax) * 60 : 0;
+    
+    // Final total
+    const finalScore = caPercentage + examPercentage;
+    const finalGrade = getGradeLetter(finalScore);
+    
+    res.json({
+      data: {
+        ca: {
+          total: caTotal,
+          maxTotal: caMaxTotal,
+          percentage: caPercentage,
+          weight: 40,
+          grades: caGrades
+        },
+        exam: {
+          total: examScore,
+          maxTotal: examMax,
+          percentage: examPercentage,
+          weight: 60,
+          grades: examGrades
+        },
+        final: {
+          score: finalScore.toFixed(1),
+          grade: finalGrade,
+          remarks: finalGrade === 'A' ? 'Excellent!' :
+                  finalGrade === 'B' ? 'Very Good' :
+                  finalGrade === 'C' ? 'Good' :
+                  finalGrade === 'D' ? 'Satisfactory' :
+                  finalGrade === 'E' ? 'Pass' : 'Needs Improvement'
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error calculating final grade:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function getGradeLetter(percentage) {
+  if (percentage >= 70) return 'A';
+  if (percentage >= 60) return 'B';
+  if (percentage >= 50) return 'C';
+  if (percentage >= 45) return 'D';
+  if (percentage >= 40) return 'E';
+  return 'F';
+}
+
+// ==================== SESSION MANAGEMENT ENDPOINTS ====================
+app.get('/api/sessions', async (req, res) => {
+  try {
+    const sessions = await prisma.session.findMany({
+      include: {
+        terms: true,
+        _count: {
+          select: { terms: true }
+        }
+      },
+      orderBy: [
+        { isActive: 'desc' },
+        { startDate: 'desc' }
+      ]
+    });
+    res.json({ data: sessions });
+  } catch (error) {
+    console.error('Error fetching sessions:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/sessions/active', async (req, res) => {
+  try {
+    const activeSession = await prisma.session.findFirst({
+      where: { isActive: true, isArchived: false },
+      include: { terms: true }
+    });
+    res.json({ data: activeSession });
+  } catch (error) {
+    console.error('Error fetching active session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/sessions', async (req, res) => {
+  try {
+    const { name, startDate, endDate, copyFromSessionId, isActive } = req.body;
+    
+    if (!name || !startDate || !endDate) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    const existingSession = await prisma.session.findUnique({
+      where: { name }
+    });
+    
+    if (existingSession) {
+      return res.status(400).json({ error: 'Session already exists' });
+    }
+    
+    if (isActive) {
+      await prisma.session.updateMany({
+        where: { isActive: true },
+        data: { isActive: false }
+      });
+    }
+    
+    const session = await prisma.session.create({
+      data: {
+        name,
+        startDate: new Date(startDate),
+        endDate: new Date(endDate),
+        isActive: isActive || false
+      }
+    });
+    
+    if (copyFromSessionId) {
+      const sourceSession = await prisma.session.findUnique({
+        where: { id: copyFromSessionId },
+        include: { terms: true }
+      });
+      
+      if (sourceSession && sourceSession.terms.length > 0) {
+        console.log(`📋 Copying ${sourceSession.terms.length} terms from ${sourceSession.name}`);
+        
+        for (const term of sourceSession.terms) {
+          await prisma.term.create({
+            data: {
+              name: term.name,
+              sessionId: session.id,
+              startDate: term.startDate,
+              endDate: term.endDate,
+              isActive: false
+            }
+          });
+        }
+        
+        console.log(`✅ Copied ${sourceSession.terms.length} terms to ${session.name}`);
+      }
+    }
+    
+    res.status(201).json({ 
+      data: session, 
+      message: 'Session created successfully' 
+    });
+    
+  } catch (error) {
+    console.error('Error creating session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/sessions/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, startDate, endDate, isActive, isArchived } = req.body;
+    
+    if (isActive) {
+      await prisma.session.updateMany({
+        where: { isActive: true },
+        data: { isActive: false }
+      });
+    }
+    
+    const session = await prisma.session.update({
+      where: { id },
+      data: {
+        name,
+        startDate: startDate ? new Date(startDate) : undefined,
+        endDate: endDate ? new Date(endDate) : undefined,
+        isActive,
+        isArchived
+      }
+    });
+    
+    res.json({ data: session, message: 'Session updated successfully' });
+  } catch (error) {
+    console.error('Error updating session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/sessions/:id/archive', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const session = await prisma.session.update({
+      where: { id },
+      data: { 
+        isActive: false,
+        isArchived: true 
+      }
+    });
+    
+    await prisma.term.updateMany({
+      where: { sessionId: id },
+      data: { isActive: false }
+    });
+    
+    res.json({ 
+      data: session, 
+      message: 'Session archived successfully' 
+    });
+    
+  } catch (error) {
+    console.error('Error archiving session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/sessions/next', async (req, res) => {
+  try {
+    const { currentSessionId } = req.body;
+    
+    const currentSession = await prisma.session.findUnique({
+      where: { id: currentSessionId },
+      include: { terms: true }
+    });
+    
+    if (!currentSession) {
+      return res.status(404).json({ error: 'Current session not found' });
+    }
+    
+    const currentYearStart = parseInt(currentSession.name.split('-')[0]);
+    const nextYearStart = currentYearStart + 1;
+    const nextYearEnd = nextYearStart + 1;
+    const nextSessionName = `${nextYearStart}-${nextYearEnd}`;
+    
+    const nextStartDate = new Date(currentSession.startDate);
+    nextStartDate.setFullYear(nextStartDate.getFullYear() + 1);
+    
+    const nextEndDate = new Date(currentSession.endDate);
+    nextEndDate.setFullYear(nextEndDate.getFullYear() + 1);
+    
+    await prisma.session.update({
+      where: { id: currentSessionId },
+      data: { isActive: false }
+    });
+    
+    const newSession = await prisma.session.create({
+      data: {
+        name: nextSessionName,
+        startDate: nextStartDate,
+        endDate: nextEndDate,
+        isActive: true
+      }
+    });
+    
+    for (const term of currentSession.terms) {
+      const termStartDate = new Date(term.startDate);
+      termStartDate.setFullYear(termStartDate.getFullYear() + 1);
+      
+      const termEndDate = new Date(term.endDate);
+      termEndDate.setFullYear(termEndDate.getFullYear() + 1);
+      
+      await prisma.term.create({
+        data: {
+          name: term.name,
+          sessionId: newSession.id,
+          startDate: termStartDate,
+          endDate: termEndDate,
+          isActive: false
+        }
+      });
+    }
+    
+    console.log(`✅ Created next session: ${nextSessionName} with ${currentSession.terms.length} terms`);
+    
+    res.json({ 
+      data: newSession, 
+      message: `Next session ${nextSessionName} created successfully` 
+    });
+    
+  } catch (error) {
+    console.error('Error creating next session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== TERM ENDPOINTS ====================
+app.get('/api/terms', async (req, res) => {
+  try {
+    const { sessionId } = req.query;
+    const where = {};
+    if (sessionId) where.sessionId = sessionId;
+    
+    const terms = await prisma.term.findMany({
+      where,
+      include: {
+        session: true
+      },
+      orderBy: [
+        { isActive: 'desc' },
+        { startDate: 'asc' }
+      ]
+    });
+    res.json({ data: terms });
+  } catch (error) {
+    console.error('Error fetching terms:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/terms/active', async (req, res) => {
+  try {
+    const activeTerm = await prisma.term.findFirst({
+      where: { isActive: true },
+      include: { session: true }
+    });
+    res.json({ data: activeTerm });
+  } catch (error) {
+    console.error('Error fetching active term:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/terms', async (req, res) => {
+  try {
+    const { name, sessionId, startDate, endDate, isActive } = req.body;
+    
+    if (!name || !sessionId || !startDate || !endDate) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    const existingTerm = await prisma.term.findFirst({
+      where: {
+        name,
+        sessionId
+      }
+    });
+    
+    if (existingTerm) {
+      return res.status(400).json({ error: 'Term already exists in this session' });
+    }
+    
+    if (isActive) {
+      await prisma.term.updateMany({
+        where: { sessionId, isActive: true },
+        data: { isActive: false }
+      });
+    }
+    
+    const term = await prisma.term.create({
+      data: {
+        name,
+        sessionId,
+        startDate: new Date(startDate),
+        endDate: new Date(endDate),
+        isActive: isActive || false
+      },
+      include: {
+        session: true
+      }
+    });
+    
+    res.status(201).json({ data: term, message: 'Term created successfully' });
+  } catch (error) {
+    console.error('Error creating term:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/terms/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, sessionId, startDate, endDate, isActive } = req.body;
+    
+    const term = await prisma.term.findUnique({
+      where: { id },
+      include: { session: true }
+    });
+    
+    if (!term) {
+      return res.status(404).json({ error: 'Term not found' });
+    }
+    
+    if (isActive) {
+      await prisma.term.updateMany({
+        where: { sessionId: term.sessionId, isActive: true },
+        data: { isActive: false }
+      });
+    }
+    
+    const updatedTerm = await prisma.term.update({
+      where: { id },
+      data: {
+        name,
+        sessionId: sessionId || term.sessionId,
+        startDate: startDate ? new Date(startDate) : undefined,
+        endDate: endDate ? new Date(endDate) : undefined,
+        isActive
+      },
+      include: {
+        session: true
+      }
+    });
+    
+    res.json({ data: updatedTerm, message: 'Term updated successfully' });
+  } catch (error) {
+    console.error('Error updating term:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/terms/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const feesCount = await prisma.fee.count({
+      where: { termId: id }
+    });
+    
+    if (feesCount > 0) {
+      return res.status(400).json({ 
+        error: 'Cannot delete term with associated fees. Delete or reassign fees first.' 
+      });
+    }
+    
+    await prisma.term.delete({
+      where: { id }
+    });
+    
+    res.json({ message: 'Term deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting term:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== BURSAR / FEE MANAGEMENT ENDPOINTS ====================
+app.get('/api/bursar/students', async (req, res) => {
+  try {
+    const students = await prisma.student.findMany({
+      include: { user: { select: { name: true, email: true } }, class: true }
+    });
+    res.json({ data: students.map(s => ({ id: s.id, name: s.user?.name, admissionNo: s.admissionNo, className: s.class?.name, classId: s.classId })) });
+  } catch (error) {
+    console.error('Error fetching students for bursar:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/fees', async (req, res) => {
+  try {
+    console.log('💰 Fetching all fees...');
+    const { termId } = req.query;
+    
+    const where = {};
+    if (termId) {
+      where.termId = termId;
+    }
+    
+    const fees = await prisma.fee.findMany({
+      where,
+      include: {
+        student: {
+          include: {
+            user: true,
+            class: true
+          }
+        },
+        term: {
+          include: {
+            session: true
+          }
+        },
+        payments: {
+          include: {
+            recordedBy: {
+              select: {
+                name: true
+              }
+            }
+          }
+        },
+        feeItems: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    console.log(`✅ Found ${fees.length} fees`);
+    
+    const transformedFees = fees.map(function(fee) {
+      let firstName = 'Unknown';
+      let lastName = '';
+      if (fee.student?.user?.name) {
+        const nameParts = fee.student.user.name.split(' ');
+        firstName = nameParts[0] || 'Unknown';
+        lastName = nameParts.slice(1).join(' ') || '';
+      }
+      
+      return {
+        id: fee.id,
+        studentId: fee.studentId,
+        termId: fee.termId,
+        totalAmount: fee.totalAmount,
+        amountPaid: fee.paidAmount,
+        balance: fee.balance,
+        status: fee.status === 'PAID' ? 'PAID' : 
+                fee.status === 'PARTIAL' ? 'PARTIALLY_PAID' : 'UNPAID',
+        receiptNo: fee.receiptNo,
+        createdAt: fee.createdAt,
+        updatedAt: fee.updatedAt,
+        student: fee.student ? {
+          id: fee.student.id,
+          admissionNo: fee.student.admissionNo || 'N/A',
+          user: {
+            firstName: firstName,
+            lastName: lastName,
+            email: fee.student.user?.email || ''
+          },
+          class: fee.student.class ? {
+            name: fee.student.class.name || '',
+            section: fee.student.class.section || ''
+          } : null
+        } : null,
+        term: fee.term ? {
+          id: fee.term.id,
+          name: fee.term.name,
+          session: {
+            id: fee.term.session?.id,
+            name: fee.term.session?.name,
+            year: fee.term.session?.name
+          }
+        } : null,
+        payments: fee.payments ? fee.payments.map(function(payment) {
+          return {
+            id: payment.id,
+            feeId: payment.feeId,
+            amount: payment.amount,
+            date: payment.paymentDate,
+            method: payment.paymentMethod,
+            reference: payment.referenceNo,
+            recordedBy: payment.recordedBy ? {
+              firstName: payment.recordedBy.name?.split(' ')[0] || '',
+              lastName: payment.recordedBy.name?.split(' ').slice(1).join(' ') || ''
+            } : null
+          };
+        }) : []
+      };
+    });
+    
+    res.json({
+      data: transformedFees
+    });
+  } catch (error) {
+    console.error('Error fetching fees:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/fees/summary', async (req, res) => {
+  try {
+    console.log('📊 Fetching fee summary...');
+    const { termId, sessionId } = req.query;
+    
+    const where = {};
+    if (termId) where.termId = termId;
+    if (sessionId) where.term = { sessionId };
+    
+    const fees = await prisma.fee.findMany({ where });
+    
+    console.log(`📊 Found ${fees.length} fees`);
+    
+    let totalExpected = 0;
+    let totalCollected = 0;
+    
+    fees.forEach(fee => {
+      totalExpected += fee.totalAmount || 0;
+      totalCollected += fee.paidAmount || 0;
+    });
+    
+    const totalOutstanding = totalExpected - totalCollected;
+    const collectionRate = totalExpected > 0 ? (totalCollected / totalExpected) * 100 : 0;
+    
+    const summary = {
+      totalExpected,
+      totalCollected,
+      totalOutstanding,
+      collectionRate: Math.round(collectionRate * 100) / 100
+    };
+    
+    console.log('📊 Summary calculated:', summary);
+    
+    res.json({
+      data: summary
+    });
+    
+  } catch (error) {
+    console.error('❌ Error fetching fee summary:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch fee summary',
+      details: error.message 
+    });
+  }
+});
+
+app.get('/api/fees/parent', async (req, res) => {
+  try {
+    console.log('👪 Fetching parent fees...');
+    
+    const parentUser = await prisma.user.findFirst({
+      where: { role: 'PARENT' }
+    });
+    
+    if (!parentUser) {
+      return res.json({ 
+        data: { 
+          fees: [], 
+          totalOutstanding: 0 
+        } 
+      });
+    }
+    
+    const parent = await prisma.parent.findUnique({
+      where: { userId: parentUser.id },
+      include: {
+        students: {
+          include: {
+            user: true,
+            class: true,
+            fees: {
+              include: {
+                payments: true,
+                term: {
+                  include: {
+                    session: true
+                  }
+                },
+                feeItems: true
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    if (!parent || parent.students.length === 0) {
+      return res.json({ 
+        data: { 
+          fees: [], 
+          totalOutstanding: 0 
+        } 
+      });
+    }
+    
+    const studentIds = parent.students.map(s => s.id);
+    
+    const fees = await prisma.fee.findMany({
+      where: {
+        studentId: { in: studentIds }
+      },
+      include: {
+        student: {
+          include: {
+            user: true,
+            class: true
+          }
+        },
+        term: {
+          include: {
+            session: true
+          }
+        },
+        payments: true,
+        feeItems: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    console.log(`✅ Found ${fees.length} fees for parent's children`);
+    
+    const totalOutstanding = fees.reduce((sum, fee) => sum + fee.balance, 0);
+    
+    const transformedFees = fees.map(fee => {
+      let firstName = 'Unknown';
+      let lastName = '';
+      if (fee.student?.user?.name) {
+        const nameParts = fee.student.user.name.split(' ');
+        firstName = nameParts[0] || 'Unknown';
+        lastName = nameParts.slice(1).join(' ') || '';
+      }
+      
+      return {
+        id: fee.id,
+        studentId: fee.studentId,
+        termId: fee.termId,
+        totalAmount: fee.totalAmount,
+        amountPaid: fee.paidAmount,
+        balance: fee.balance,
+        status: fee.status === 'PAID' ? 'PAID' : 
+                fee.status === 'PARTIAL' ? 'PARTIALLY_PAID' : 'UNPAID',
+        createdAt: fee.createdAt,
+        updatedAt: fee.updatedAt,
+        student: {
+          id: fee.student?.id,
+          admissionNo: fee.student?.admissionNo || 'N/A',
+          user: {
+            firstName: firstName,
+            lastName: lastName,
+            email: fee.student?.user?.email || ''
+          },
+          class: fee.student?.class ? {
+            name: fee.student.class.name,
+            section: fee.student.class.section || ''
+          } : null
+        },
+        term: fee.term ? {
+          id: fee.term.id,
+          name: fee.term.name,
+          session: {
+            id: fee.term.session?.id,
+            name: fee.term.session?.name,
+            year: fee.term.session?.name
+          }
+        } : null,
+        payments: fee.payments ? fee.payments.map(p => ({
+          id: p.id,
+          amount: p.amount,
+          date: p.paymentDate,
+          method: p.paymentMethod,
+          reference: p.referenceNo
+        })) : []
+      };
+    });
+    
+    res.json({
+      data: {
+        fees: transformedFees,
+        totalOutstanding
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error fetching parent fees:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/fees/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const fee = await prisma.fee.findUnique({
+      where: { id },
+      include: {
+        student: {
+          include: {
+            user: true,
+            class: true
+          }
+        },
+        term: {
+          include: {
+            session: true
+          }
+        },
+        payments: {
+          include: {
+            recordedBy: {
+              select: {
+                name: true
+              }
+            }
+          },
+          orderBy: { paymentDate: 'desc' }
+        },
+        feeItems: true,
+        discounts: {
+          include: {
+            approvedBy: {
+              select: {
+                name: true
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    if (!fee) {
+      return res.status(404).json({ error: 'Fee not found' });
+    }
+    
+    let firstName = 'Unknown';
+    let lastName = '';
+    if (fee.student?.user?.name) {
+      const nameParts = fee.student.user.name.split(' ');
+      firstName = nameParts[0] || 'Unknown';
+      lastName = nameParts.slice(1).join(' ') || '';
+    }
+    
+    const transformedFee = {
+      id: fee.id,
+      studentId: fee.studentId,
+      termId: fee.termId,
+      totalAmount: fee.totalAmount,
+      amountPaid: fee.paidAmount,
+      balance: fee.balance,
+      status: fee.status === 'PAID' ? 'PAID' : 
+              fee.status === 'PARTIAL' ? 'PARTIALLY_PAID' : 'UNPAID',
+      receiptNo: fee.receiptNo,
+      createdAt: fee.createdAt,
+      updatedAt: fee.updatedAt,
+      student: fee.student ? {
+        id: fee.student.id,
+        admissionNo: fee.student.admissionNo || 'N/A',
+        user: {
+          firstName: firstName,
+          lastName: lastName,
+          email: fee.student.user?.email || ''
+        },
+        class: fee.student.class ? {
+          name: fee.student.class.name,
+          section: fee.student.class.section || ''
+        } : null
+      } : null,
+      term: fee.term ? {
+        id: fee.term.id,
+        name: fee.term.name,
+        session: {
+          id: fee.term.session?.id,
+          name: fee.term.session?.name,
+          year: fee.term.session?.name
+        }
+      } : null,
+      payments: fee.payments ? fee.payments.map(function(payment) {
+        return {
+          id: payment.id,
+          feeId: payment.feeId,
+          amount: payment.amount,
+          date: payment.paymentDate,
+          method: payment.paymentMethod,
+          reference: payment.referenceNo,
+          recordedBy: payment.recordedBy ? {
+            firstName: payment.recordedBy.name?.split(' ')[0] || '',
+            lastName: payment.recordedBy.name?.split(' ').slice(1).join(' ') || ''
+          } : null
+        };
+      }) : []
+    };
+    
+    res.json({
+      data: transformedFee
+    });
+  } catch (error) {
+    console.error('Error fetching fee:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/fees/student/:studentId', async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const fees = await prisma.fee.findMany({
+      where: { studentId },
+      include: {
+        term: {
+          include: {
+            session: true
+          }
+        },
+        payments: true,
+        feeItems: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    const transformedFees = fees.map(function(fee) {
+      return {
+        id: fee.id,
+        studentId: fee.studentId,
+        termId: fee.termId,
+        totalAmount: fee.totalAmount,
+        amountPaid: fee.paidAmount,
+        balance: fee.balance,
+        status: fee.status === 'PAID' ? 'PAID' : 
+                fee.status === 'PARTIAL' ? 'PARTIALLY_PAID' : 'UNPAID',
+        createdAt: fee.createdAt,
+        updatedAt: fee.updatedAt,
+        term: fee.term ? {
+          id: fee.term.id,
+          name: fee.term.name,
+          session: {
+            id: fee.term.session?.id,
+            name: fee.term.session?.name,
+            year: fee.term.session?.name
+          }
+        } : null,
+        payments: fee.payments
+      };
+    });
+    
+    res.json({
+      data: transformedFees
+    });
+  } catch (error) {
+    console.error('Error fetching student fees:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/fees', async (req, res) => {
+  try {
+    const { studentId, termId, totalAmount } = req.body;
+    console.log('📝 Creating fee record:', { studentId, termId, totalAmount });
+    
+    if (!studentId || !termId || !totalAmount) {
+      console.log('❌ Missing required fields');
+      return res.status(400).json({ 
+        error: 'Missing required fields: studentId, termId, and totalAmount are required' 
+      });
+    }
+    
+    console.log('🔍 Checking student with ID:', studentId);
+    const student = await prisma.student.findUnique({
+      where: { id: studentId },
+      include: {
+        user: true,
+        class: true
+      }
+    });
+    
+    if (!student) {
+      console.log('❌ Student not found:', studentId);
+      return res.status(404).json({ error: 'Student not found' });
+    }
+    console.log('✅ Student found:', { 
+      id: student.id, 
+      name: student.user?.name,
+      admissionNo: student.admissionNo 
+    });
+    
+    console.log('🔍 Checking term with ID:', termId);
+    let term;
+    if (termId) {
+      term = await prisma.term.findUnique({
+        where: { id: termId },
+        include: {
+          session: true
+        }
+      });
+    } else {
+      term = await prisma.term.findFirst({
+        where: { isActive: true },
+        include: {
+          session: true
+        }
+      });
+    }
+    
+    if (!term) {
+      console.log('❌ Term not found with ID:', termId);
+      const availableTerms = await prisma.term.findMany({
+        include: { session: true }
+      });
+      console.log('Available terms:', availableTerms.map(t => ({ id: t.id, name: t.name, session: t.session?.name, isActive: t.isActive })));
+      
+      return res.status(404).json({ 
+        error: 'Term not found',
+        message: 'The selected term does not exist. Please check the term ID.',
+        availableTerms: availableTerms.map(t => ({ id: t.id, name: t.name, session: t.session?.name, isActive: t.isActive }))
+      });
+    }
+    console.log('✅ Term found:', { id: term.id, name: term.name, session: term.session?.name });
+    
+    console.log('💾 Creating fee in database...');
+    const dueDate = term.endDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    
+    const fee = await prisma.fee.create({
+      data: {
+        studentId,
+        termId: term.id,
+        totalAmount: parseFloat(totalAmount),
+        paidAmount: 0,
+        balance: parseFloat(totalAmount),
+        status: 'PENDING',
+        dueDate: dueDate,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      include: {
+        student: {
+          include: {
+            user: true,
+            class: true
+          }
+        },
+        term: {
+          include: {
+            session: true
+          }
+        }
+      }
+    });
+    console.log('✅ Fee created with ID:', fee.id);
+    
+    let firstName = 'Unknown';
+    let lastName = '';
+    if (fee.student?.user?.name) {
+      const nameParts = fee.student.user.name.split(' ');
+      firstName = nameParts[0] || 'Unknown';
+      lastName = nameParts.slice(1).join(' ') || '';
+    }
+    
+    const transformedFee = {
+      id: fee.id,
+      studentId: fee.studentId,
+      termId: fee.termId,
+      totalAmount: fee.totalAmount,
+      amountPaid: 0,
+      balance: fee.balance,
+      status: 'UNPAID',
+      createdAt: fee.createdAt,
+      updatedAt: fee.updatedAt,
+      student: fee.student ? {
+        id: fee.student.id,
+        admissionNo: fee.student.admissionNo || 'N/A',
+        user: {
+          firstName: firstName,
+          lastName: lastName,
+          email: fee.student.user?.email || ''
+        },
+        class: fee.student.class ? {
+          name: fee.student.class.name,
+          section: fee.student.class.section || ''
+        } : null
+      } : null,
+      term: fee.term ? {
+        id: fee.term.id,
+        name: fee.term.name,
+        session: {
+          id: fee.term.session?.id,
+          name: fee.term.session?.name,
+          year: fee.term.session?.name
+        }
+      } : null,
+      payments: []
+    };
+    
+    console.log('✅ Sending response to client');
+    res.status(201).json({
+      data: transformedFee
+    });
+    
+  } catch (error) {
+    console.error('❌ ERROR CREATING FEE:');
+    console.error('Error name:', error.name);
+    console.error('Error message:', error.message);
+    console.error('Error code:', error.code);
+    
+    if (error.code === 'P2002') {
+      return res.status(400).json({ error: 'A fee record for this student and term already exists' });
+    }
+    if (error.code === 'P2003') {
+      return res.status(400).json({ error: 'Invalid student or term ID' });
+    }
+    
+    res.status(500).json({ 
+      error: 'Failed to create fee record',
+      details: error.message 
+    });
+  }
+});
+
+app.post('/api/fees/bulk', async (req, res) => {
+  try {
+    const { classFees, termId } = req.body;
+    
+    if (!classFees || !termId || !Array.isArray(classFees) || classFees.length === 0) {
+      return res.status(400).json({ error: 'Missing required fields: classFees array and termId are required' });
+    }
+    
+    const term = await prisma.term.findUnique({
+      where: { id: termId },
+      include: { session: true }
+    });
+    
+    if (!term) {
+      return res.status(404).json({ error: 'Term not found' });
+    }
+    
+    const dueDate = term.endDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    let totalFeesCreated = 0;
+    const results = [];
+    
+    for (const classFee of classFees) {
+      const { classId, amount, className } = classFee;
+      
+      if (!amount || amount <= 0) continue;
+      
+      const students = await prisma.student.findMany({
+        where: { classId },
+        select: { id: true }
+      });
+      
+      if (students.length === 0) {
+        results.push({ classId, className, count: 0, amount, error: 'No students found' });
+        continue;
+      }
+      
+      const fees = await Promise.all(
+        students.map(student => 
+          prisma.fee.create({
+            data: {
+              studentId: student.id,
+              termId,
+              totalAmount: amount,
+              paidAmount: 0,
+              balance: amount,
+              status: 'PENDING',
+              dueDate,
+              createdAt: new Date(),
+              updatedAt: new Date()
+            }
+          })
+        )
+      );
+      
+      totalFeesCreated += fees.length;
+      results.push({ classId, className, count: fees.length, amount, success: true });
+    }
+    
+    console.log(`✅ Bulk fee creation completed: ${totalFeesCreated} fee records created`);
+    
+    res.json({
+      message: `Successfully created ${totalFeesCreated} fee records`,
+      totalFees: totalFeesCreated,
+      results
+    });
+    
+  } catch (error) {
+    console.error('Error creating bulk fees:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/fees/:feeId/payments', async (req, res) => {
+  try {
+    const { feeId } = req.params;
+    const { amount, method, reference } = req.body;
+    
+    console.log('💵 Recording payment for fee:', feeId, { amount, method, reference });
+    
+    const bursarUser = await prisma.user.findFirst({
+      where: { role: 'BURSAR' }
+    });
+    
+    if (!bursarUser) {
+      return res.status(404).json({ error: 'Bursar user not found' });
+    }
+    
+    const result = await prisma.$transaction(async function(tx) {
+      const fee = await tx.fee.findUnique({
+        where: { id: feeId }
+      });
+      
+      if (!fee) {
+        throw new Error('Fee not found');
+      }
+      
+      const newPaidAmount = fee.paidAmount + parseFloat(amount);
+      const newBalance = fee.totalAmount - newPaidAmount;
+      
+      let newStatus = fee.status;
+      if (newBalance <= 0) {
+        newStatus = 'PAID';
+      } else if (newPaidAmount > 0) {
+        newStatus = 'PARTIAL';
+      }
+      
+      const payment = await tx.payment.create({
+        data: {
+          feeId,
+          amount: parseFloat(amount),
+          paymentMethod: method,
+          referenceNo: reference,
+          recordedById: bursarUser.id,
+          status: 'COMPLETED'
+        }
+      });
+      
+      const updatedFee = await tx.fee.update({
+        where: { id: feeId },
+        data: {
+          paidAmount: newPaidAmount,
+          balance: newBalance,
+          status: newStatus
+        },
+        include: {
+          student: {
+            include: {
+              user: true
+            }
+          }
+        }
+      });
+      
+      return { payment, fee: updatedFee };
+    });
+    
+    res.status(201).json({
+      data: {
+        id: result.payment.id,
+        feeId: result.payment.feeId,
+        amount: result.payment.amount,
+        date: result.payment.paymentDate,
+        method: result.payment.paymentMethod,
+        reference: result.payment.referenceNo,
+        recordedBy: result.payment.recordedBy ? {
+          firstName: result.payment.recordedBy.name?.split(' ')[0] || '',
+          lastName: result.payment.recordedBy.name?.split(' ').slice(1).join(' ') || ''
+        } : null
+      }
+    });
+  } catch (error) {
+    console.error('Error recording payment:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/fees/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { studentId, termId, totalAmount } = req.body;
+    
+    const fee = await prisma.fee.findUnique({
+      where: { id }
+    });
+    
+    if (!fee) {
+      return res.status(404).json({ error: 'Fee not found' });
+    }
+    
+    const updatedFee = await prisma.fee.update({
+      where: { id },
+      data: {
+        studentId: studentId || fee.studentId,
+        termId: termId || fee.termId,
+        totalAmount: totalAmount ? parseFloat(totalAmount) : fee.totalAmount,
+        balance: totalAmount ? (parseFloat(totalAmount) - fee.paidAmount) : fee.balance
+      },
+      include: {
+        student: {
+          include: {
+            user: true
+          }
+        },
+        term: {
+          include: {
+            session: true
+          }
+        }
+      }
+    });
+    
+    res.json({
+      data: updatedFee
+    });
+  } catch (error) {
+    console.error('Error updating fee:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/fees/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    await prisma.$transaction([
+      prisma.payment.deleteMany({
+        where: { feeId: id }
+      }),
+      prisma.feeItem.deleteMany({
+        where: { feeId: id }
+      }),
+      prisma.discount.deleteMany({
+        where: { feeId: id }
+      }),
+      prisma.fee.delete({
+        where: { id }
+      })
+    ]);
+    
+    res.json({ 
+      data: { message: 'Fee deleted successfully' } 
+    });
+  } catch (error) {
+    console.error('Error deleting fee:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/fees/receipt/:feeId', async (req, res) => {
+  try {
+    const { feeId } = req.params;
+    
+    const fee = await prisma.fee.findUnique({
+      where: { id: feeId },
+      include: {
+        student: {
+          include: {
+            user: true
+          }
+        },
+        term: {
+          include: {
+            session: true
+          }
+        },
+        payments: true
+      }
+    });
+    
+    if (!fee) {
+      return res.status(404).json({ error: 'Fee not found' });
+    }
+    
+    res.json({
+      data: {
+        receiptNo: `RCP-${Date.now()}`,
+        fee,
+        generatedAt: new Date()
+      }
+    });
+  } catch (error) {
+    console.error('Error generating receipt:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/bursar/dashboard', async (req, res) => {
+  try {
+    const fees = await prisma.fee.findMany({
+      include: {
+        payments: true,
+        term: {
+          include: {
+            session: true
+          }
+        }
+      }
+    });
+    
+    const totalExpected = fees.reduce(function(sum, fee) { return sum + fee.totalAmount; }, 0);
+    const totalPaid = fees.reduce(function(sum, fee) { return sum + fee.paidAmount; }, 0);
+    const outstanding = totalExpected - totalPaid;
+    const collectionRate = totalExpected > 0 ? (totalPaid / totalExpected) * 100 : 0;
+    
+    const paidCount = fees.filter(function(f) { return f.status === 'PAID'; }).length;
+    const pendingCount = fees.filter(function(f) { return f.status === 'PENDING'; }).length;
+    const partialCount = fees.filter(function(f) { return f.status === 'PARTIAL'; }).length;
+    const overdueCount = fees.filter(function(f) { return f.status === 'OVERDUE'; }).length;
+    
+    res.json({
+      data: {
+        summary: {
+          totalExpected,
+          totalPaid,
+          outstanding,
+          collectionRate: collectionRate.toFixed(1)
+        },
+        counts: {
+          paid: paidCount,
+          pending: pendingCount,
+          partial: partialCount,
+          overdue: overdueCount,
+          total: fees.length
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching bursar dashboard:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== DASHBOARD ENDPOINTS ====================
+app.get('/api/dashboard/principal', async (req, res) => {
+  try {
+    const totalStudents = await prisma.student.count();
+    const totalTeachers = await prisma.teacher.count();
+    const totalParents = await prisma.parent.count();
+    const totalClasses = await prisma.class.count();
+    
+    const recentStudents = await prisma.student.findMany({
+      take: 5,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        user: true,
+        class: true
+      }
+    });
+    
+    const recentParents = await prisma.parent.findMany({
+      take: 5,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        user: {
+          select: {
+            name: true,
+            email: true
+          }
+        },
+        students: {
+          take: 3,
+          include: {
+            user: true,
+            class: true
+          }
+        }
+      }
+    });
+    
+    const fees = await prisma.fee.findMany();
+    const totalExpected = fees.reduce((sum, fee) => sum + fee.totalAmount, 0);
+    const totalCollected = fees.reduce((sum, fee) => sum + fee.paidAmount, 0);
+    const collectionRate = totalExpected > 0 ? (totalCollected / totalExpected) * 100 : 0;
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayAttendance = await prisma.attendance.count({
+      where: {
+        date: {
+          gte: today,
+          lt: new Date(today.getTime() + 24 * 60 * 60 * 1000)
+        }
+      }
+    });
+    
+    const formattedParents = recentParents.map(parent => ({
+      id: parent.id,
+      name: parent.user?.name || 'Unknown',
+      email: parent.user?.email || '',
+      childrenCount: parent.students.length,
+      children: parent.students.map(s => ({
+        id: s.id,
+        name: s.user?.name,
+        admissionNo: s.admissionNo,
+        className: s.class?.name
+      }))
+    }));
+    
+    res.json({
+      data: {
+        stats: {
+          totalStudents,
+          totalTeachers,
+          totalParents,
+          totalClasses,
+          totalExpected,
+          totalCollected,
+          collectionRate: Math.round(collectionRate),
+          todayAttendance
+        },
+        recentStudents: recentStudents.map(s => ({
+          id: s.id,
+          name: s.user?.name,
+          admissionNo: s.admissionNo,
+          className: s.class?.name,
+          createdAt: s.createdAt
+        })),
+        recentParents: formattedParents
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching principal dashboard:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/dashboard/admin', async (req, res) => {
+  try {
+    const totalStudents = await prisma.student.count();
+    const totalTeachers = await prisma.teacher.count();
+    const totalParents = await prisma.parent.count();
+    const totalClasses = await prisma.class.count();
+    const totalSubjects = await prisma.subject.count();
+    
+    const recentUsers = await prisma.user.findMany({
+      take: 10,
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        createdAt: true
+      }
+    });
+    
+    const parents = await prisma.parent.findMany({
+      take: 5,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        user: {
+          select: {
+            name: true,
+            email: true
+          }
+        },
+        students: {
+          include: {
+            user: true,
+            class: true
+          }
+        }
+      }
+    });
+    
+    const fees = await prisma.fee.findMany();
+    const totalExpected = fees.reduce((sum, fee) => sum + fee.totalAmount, 0);
+    const totalCollected = fees.reduce((sum, fee) => sum + fee.paidAmount, 0);
+    
+    const classDistribution = await prisma.class.findMany({
+      include: {
+        _count: {
+          select: { students: true }
+        }
+      }
+    });
+    
+    const formattedParents = parents.map(parent => ({
+      id: parent.id,
+      name: parent.user?.name || 'Unknown',
+      email: parent.user?.email || '',
+      childrenCount: parent.students.length,
+      children: parent.students.map(s => ({
+        id: s.id,
+        name: s.user?.name,
+        admissionNo: s.admissionNo,
+        className: s.class?.name
+      }))
+    }));
+    
+    res.json({
+      data: {
+        stats: {
+          totalStudents,
+          totalTeachers,
+          totalParents,
+          totalClasses,
+          totalSubjects,
+          totalExpected,
+          totalCollected,
+          outstanding: totalExpected - totalCollected
+        },
+        recentUsers,
+        classDistribution: classDistribution.map(c => ({
+          name: c.name,
+          studentCount: c._count.students
+        })),
+        recentParents: formattedParents
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching admin dashboard:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/dashboard/bursar', async (req, res) => {
+  try {
+    const fees = await prisma.fee.findMany({
+      include: {
+        payments: true,
+        student: {
+          include: {
+            user: true
+          }
+        },
+        term: {
+          include: {
+            session: true
+          }
+        }
+      }
+    });
+    
+    const totalExpected = fees.reduce((sum, fee) => sum + fee.totalAmount, 0);
+    const totalPaid = fees.reduce((sum, fee) => sum + fee.paidAmount, 0);
+    const outstanding = totalExpected - totalPaid;
+    const collectionRate = totalExpected > 0 ? (totalPaid / totalExpected) * 100 : 0;
+    
+    const payments = await prisma.payment.findMany();
+    const paymentMethods = {};
+    payments.forEach(p => {
+      paymentMethods[p.paymentMethod] = (paymentMethods[p.paymentMethod] || 0) + p.amount;
+    });
+    
+    const recentPayments = await prisma.payment.findMany({
+      take: 5,
+      orderBy: { paymentDate: 'desc' },
+      include: {
+        fee: {
+          include: {
+            student: {
+              include: {
+                user: true
+              }
+            },
+            term: {
+              include: {
+                session: true
+              }
+            }
+          }
+        },
+        recordedBy: true
+      }
+    });
+    
+    const paidCount = fees.filter(f => f.status === 'PAID').length;
+    const pendingCount = fees.filter(f => f.status === 'PENDING').length;
+    const partialCount = fees.filter(f => f.status === 'PARTIAL').length;
+    const overdueCount = fees.filter(f => f.status === 'OVERDUE').length;
+    
+    res.json({
+      data: {
+        summary: {
+          totalExpected,
+          totalPaid,
+          outstanding,
+          collectionRate: collectionRate.toFixed(1),
+          totalFees: fees.length
+        },
+        breakdown: {
+          paid: paidCount,
+          pending: pendingCount,
+          partial: partialCount,
+          overdue: overdueCount
+        },
+        paymentMethods,
+        recentPayments: recentPayments.map(p => ({
+          id: p.id,
+          amount: p.amount,
+          method: p.paymentMethod,
+          date: p.paymentDate,
+          studentName: p.fee?.student?.user?.name || 'Unknown',
+          recordedBy: p.recordedBy?.name || 'System'
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching bursar dashboard:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Teacher Dashboard - Filtered by teacher's assigned classes and subjects (FIXED VERSION)
+app.get('/api/dashboard/teacher', async (req, res) => {
+  try {
+    console.log('🔍 Fetching teacher dashboard...');
+    
+    const authHeader = req.headers.authorization;
+    let userId = null;
+    
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = Buffer.from(token, 'base64').toString();
+        userId = decoded.split(':')[0];
+        console.log('👤 User ID from token:', userId);
+      } catch (e) {
+        console.log('Token decode error, using first teacher');
+      }
+    }
+    
+    let teacher;
+    if (userId) {
+      teacher = await prisma.teacher.findFirst({
+        where: { userId: userId },
+        include: {
+          user: true,
+          subjects: {
+            include: {
+              classes: {
+                include: {
+                  class: true
+                }
+              }
+            }
+          },
+          classes: true
+        }
+      });
+    }
+    
+    if (!teacher) {
+      teacher = await prisma.teacher.findFirst({
+        include: {
+          user: true,
+          subjects: {
+            include: {
+              classes: {
+                include: {
+                  class: true
+                }
+              }
+            }
+          },
+          classes: true
+        }
+      });
+    }
+
+    if (!teacher) {
+      console.log('⚠️ No teacher profile found');
+      return res.json({
+        data: {
+          teacher: { name: "No Teacher Found", subjects: [] },
+          stats: {
+            totalStudents: 0,
+            totalClasses: 0,
+            totalSubjects: 0,
+            todayAttendance: 0
+          },
+          recentGrades: [],
+          students: []
+        }
+      });
+    }
+
+    console.log('👨‍🏫 Teacher found:', teacher.user?.name);
+    console.log('📚 Teacher assigned classes:', teacher.classes.map(c => ({ id: c.id, name: c.name })));
+    
+    // Get the IDs of classes this teacher is assigned to
+    const teacherClassIds = new Set(teacher.classes.map(c => c.id));
+    const teacherClassNames = new Set(teacher.classes.map(c => c.name));
+    
+    console.log('📋 Teacher class IDs:', Array.from(teacherClassIds));
+    console.log('📋 Teacher class names:', Array.from(teacherClassNames));
+    
+    // Filter subjects to ONLY show classes the teacher is assigned to
+    const formattedSubjects = [];
+    
+    teacher.subjects.forEach(subject => {
+      console.log(`\n📖 Processing subject: ${subject.name}`);
+      console.log(`   Subject classes:`, subject.classes.map(sc => ({ 
+        classId: sc.classId, 
+        className: sc.class?.name 
+      })));
+      
+      // Check each class this subject is associated with
+      if (subject.classes && subject.classes.length > 0) {
+        subject.classes.forEach(subjectClass => {
+          const className = subjectClass.class?.name;
+          const classId = subjectClass.classId;
+          
+          // ONLY include this subject-class pair if the teacher is assigned to this class
+          if (className && teacherClassNames.has(className)) {
+            console.log(`   ✅ Including: ${subject.name} -> ${className} (teacher assigned)`);
+            formattedSubjects.push({
+              id: subject.id,
+              name: subject.name,
+              className: className,
+              classId: classId
+            });
+          } else {
+            console.log(`   ❌ Excluding: ${subject.name} -> ${className} (teacher not assigned to this class)`);
+          }
+        });
+      } else {
+        // If no class associations, only add if it's a default subject for teacher's classes
+        console.log(`   ⚠️ Subject ${subject.name} has no class associations`);
+      }
+    });
+    
+    console.log('\n📖 Final formatted subjects (only teacher\'s classes):', formattedSubjects.map(s => `${s.name} -> ${s.className}`));
+    
+    const teacherClasses = teacher.classes || [];
+    const classIds = teacherClasses.map(c => c.id);
+    
+    let students = [];
+    if (classIds.length > 0) {
+      students = await prisma.student.findMany({
+        where: {
+          classId: { in: classIds }
+        },
+        include: {
+          user: true,
+          class: true
+        },
+        orderBy: {
+          user: {
+            name: 'asc'
+          }
+        }
+      });
+      console.log(`👨‍🎓 Found ${students.length} students from teacher's ${teacherClasses.length} classes`);
+    } else {
+      console.log('⚠️ Teacher has no assigned classes');
+    }
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    let todayAttendance = 0;
+    
+    if (classIds.length > 0) {
+      todayAttendance = await prisma.attendance.count({
+        where: {
+          classId: { in: classIds },
+          date: {
+            gte: today,
+            lt: new Date(today.getTime() + 24 * 60 * 60 * 1000)
+          }
+        }
+      });
+    }
+    
+    const studentIds = students.map(s => s.id);
+    let recentGrades = [];
+    
+    if (teacher.subjects.length > 0 && studentIds.length > 0) {
+      const subjectIds = teacher.subjects.map(s => s.id);
+      
+      recentGrades = await prisma.grade.findMany({
+        take: 20,
+        orderBy: { createdAt: 'desc' },
+        where: {
+          AND: [
+            { subjectId: { in: subjectIds } },
+            { studentId: { in: studentIds } }
+          ]
+        },
+        include: {
+          student: {
+            include: {
+              user: true
+            }
+          },
+          subject: true
+        }
+      });
+      console.log(`📊 Found ${recentGrades.length} recent grades for teacher's subjects`);
+    }
+    
+    const formattedStudents = students.map(student => ({
+      id: student.id,
+      name: student.user?.name || 'Unknown',
+      firstName: student.user?.name?.split(' ')[0] || '',
+      lastName: student.user?.name?.split(' ').slice(1).join(' ') || '',
+      admissionNo: student.admissionNo || 'N/A',
+      className: student.class?.name || 'No Class'
+    }));
+    
+    const formattedGrades = recentGrades.map(grade => ({
+      id: grade.id,
+      studentName: grade.student?.user?.name || 'Unknown',
+      subjectName: grade.subject?.name || 'Unknown',
+      score: grade.score,
+      type: grade.type,
+      createdAt: grade.createdAt
+    }));
+    
+    const formattedClasses = teacher.classes.map(cls => ({
+      id: cls.id,
+      name: cls.name
+    }));
+    
+    const responseData = {
+      data: {
+        teacher: {
+          id: teacher.id,
+          name: teacher.user?.name || 'Teacher',
+          subjects: formattedSubjects,
+          classes: formattedClasses
+        },
+        stats: {
+          totalStudents: students.length,
+          totalClasses: teacherClasses.length,
+          totalSubjects: formattedSubjects.length,
+          todayAttendance: todayAttendance
+        },
+        recentGrades: formattedGrades,
+        students: formattedStudents
+      }
+    };
+    
+    console.log('\n✅ Dashboard data prepared:', {
+      teacherName: responseData.data.teacher.name,
+      studentsCount: responseData.data.stats.totalStudents,
+      classesCount: responseData.data.stats.totalClasses,
+      subjectsCount: responseData.data.stats.totalSubjects,
+      formattedSubjects: responseData.data.teacher.subjects.map(s => `${s.name} (${s.className})`),
+      gradesCount: responseData.data.recentGrades.length
+    });
+    
+    res.json(responseData);
+    
+  } catch (error) {
+    console.error('❌ Error fetching teacher dashboard:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch teacher dashboard',
+      details: error.message 
+    });
+  }
+});
+
+app.get('/api/dashboard/parent', async (req, res) => {
+  try {
+    const parentUser = await prisma.user.findFirst({
+      where: { role: 'PARENT' }
+    });
+    
+    if (!parentUser) {
+      return res.json({
+        data: {
+          message: 'No parent profile found',
+          parent: { name: '', email: '' },
+          students: [],
+          totalOutstanding: 0,
+          totalExpected: 0,
+          totalPaid: 0
+        }
+      });
+    }
+    
+    const parent = await prisma.parent.findUnique({
+      where: { userId: parentUser.id },
+      include: {
+        user: true,
+        students: {
+          include: {
+            user: true,
+            class: true,
+            fees: {
+              include: {
+                payments: true,
+                term: {
+                  include: {
+                    session: true
+                  }
+                },
+                feeItems: true
+              },
+              orderBy: { createdAt: 'desc' }
+            },
+            attendances: {
+              take: 5,
+              orderBy: { date: 'desc' }
+            },
+            grades: {
+              include: {
+                subject: true
+              },
+              take: 10,
+              orderBy: { createdAt: 'desc' }
+            }
+          }
+        }
+      }
+    });
+    
+    if (!parent) {
+      return res.json({
+        data: {
+          message: 'Parent profile not found',
+          parent: { name: '', email: '' },
+          students: [],
+          totalOutstanding: 0,
+          totalExpected: 0,
+          totalPaid: 0
+        }
+      });
+    }
+    
+    let totalOutstanding = 0;
+    let totalExpected = 0;
+    let totalPaid = 0;
+    
+    const transformedStudents = parent.students.map(student => {
+      let studentTotalFees = 0;
+      let studentTotalPaid = 0;
+      let studentTotalOutstanding = 0;
+      
+      student.fees.forEach(fee => {
+        studentTotalFees += fee.totalAmount;
+        studentTotalPaid += fee.paidAmount;
+        studentTotalOutstanding += fee.balance;
+      });
+      
+      totalExpected += studentTotalFees;
+      totalPaid += studentTotalPaid;
+      totalOutstanding += studentTotalOutstanding;
+      
+      const recentPayments = student.fees.flatMap(fee => 
+        fee.payments.map(payment => ({
+          id: payment.id,
+          amount: payment.amount,
+          date: payment.paymentDate,
+          method: payment.paymentMethod,
+          term: fee.term?.name,
+          session: fee.term?.session?.name
+        }))
+      ).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()).slice(0, 5);
+      
+      return {
+        id: student.id,
+        name: student.user?.name || 'Unknown',
+        admissionNo: student.admissionNo || 'N/A',
+        className: student.class?.name || 'No Class',
+        feeSummary: {
+          totalFees: studentTotalFees,
+          totalPaid: studentTotalPaid,
+          totalOutstanding: studentTotalOutstanding,
+          paymentProgress: studentTotalFees > 0 ? (studentTotalPaid / studentTotalFees) * 100 : 0
+        },
+        recentPayments,
+        recentAttendance: student.attendances.map(a => ({
+          date: a.date,
+          status: a.status
+        })),
+        recentGrades: student.grades.map(g => ({
+          id: g.id,
+          subjectName: g.subject?.name,
+          score: g.score,
+          type: g.type,
+          createdAt: g.createdAt
+        }))
+      };
+    });
+    
+    res.json({
+      data: {
+        parent: {
+          name: parent.user?.name,
+          email: parent.user?.email
+        },
+        students: transformedStudents,
+        totalOutstanding,
+        totalExpected,
+        totalPaid
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching parent dashboard:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/dashboard/student', async (req, res) => {
+  try {
+    const student = await prisma.student.findFirst({
+      include: {
+        user: true,
+        class: true,
+        attendances: {
+          orderBy: { date: 'desc' },
+          take: 10
+        },
+        grades: {
+          include: {
+            subject: true
+          },
+          orderBy: { createdAt: 'desc' }
+        },
+        fees: {
+          include: {
+            payments: true,
+            term: {
+              include: {
+                session: true
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    if (!student) {
+      return res.json({
+        data: {
+          message: 'No student profile found'
+        }
+      });
+    }
+    
+    const totalAttendanceDays = student.attendances.length;
+    const presentDays = student.attendances.filter(a => a.status === 'PRESENT').length;
+    const attendancePercentage = totalAttendanceDays > 0 ? (presentDays / totalAttendanceDays) * 100 : 0;
+    
+    const grades = student.grades;
+    const averageGrade = grades.length > 0 
+      ? grades.reduce((sum, g) => sum + g.score, 0) / grades.length 
+      : 0;
+    
+    const totalFees = student.fees.reduce((sum, f) => sum + f.totalAmount, 0);
+    const paidFees = student.fees.reduce((sum, f) => sum + f.paidAmount, 0);
+    const outstandingFees = totalFees - paidFees;
+    
+    res.json({
+      data: {
+        student: {
+          id: student.id,
+          name: student.user?.name,
+          admissionNo: student.admissionNo,
+          className: student.class?.name
+        },
+        stats: {
+          totalAttendanceDays,
+          presentDays,
+          attendancePercentage: Math.round(attendancePercentage),
+          averageGrade: Math.round(averageGrade * 10) / 10,
+          totalFees,
+          paidFees,
+          outstandingFees
+        },
+        recentAttendances: student.attendances.map(a => ({
+          date: a.date,
+          status: a.status
+        })),
+        grades: student.grades.map(g => ({
+          id: g.id,
+          subjectName: g.subject?.name,
+          score: g.score,
+          type: g.type,
+          createdAt: g.createdAt
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching student dashboard:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== START SERVER ====================
+const server = app.listen(port, () => {
+  console.log(`\n🚀 Server running on http://localhost:${port}`);
+  
+  console.log('\n🔍 REGISTERED ROUTES:');
+  if (app._router && app._router.stack) {
+    app._router.stack.forEach(function(r) {
+      if (r.route && r.route.path) {
+        console.log(`${Object.keys(r.route.methods).join(', ').toUpperCase()} ${r.route.path}`);
+      }
+    });
+  }
+  
+  console.log(`\n📚 API Endpoints:`);
+  console.log(`   🔐 AUTH`);
+  console.log(`     POST   /api/auth/login`);
+  console.log(`     GET    /api/auth/me`);
+  console.log(`     POST   /api/auth/register`);
+  console.log(`   👥 USERS`);
+  console.log(`     GET    /api/users`);
+  console.log(`     GET    /api/users/role/:role`);
+  console.log(`   🏫 CLASSES`);
+  console.log(`     GET    /api/classes`);
+  console.log(`     GET    /api/classes/:id`);
+  console.log(`     POST   /api/classes`);
+  console.log(`     PUT    /api/classes/:id`);
+  console.log(`     DELETE /api/classes/:id`);
+  console.log(`   👨‍🏫 TEACHERS`);
+  console.log(`     GET    /api/teachers`);
+  console.log(`     GET    /api/teachers/:id`);
+  console.log(`     POST   /api/teachers`);
+  console.log(`     PUT    /api/teachers/:id`);
+  console.log(`     DELETE /api/teachers/:id`);
+  console.log(`   🎓 STUDENTS`);
+  console.log(`     GET    /api/students`);
+  console.log(`     GET    /api/students/:id`);
+  console.log(`     POST   /api/students`);
+  console.log(`     PUT    /api/students/:id`);
+  console.log(`     DELETE /api/students/:id (with cascade deletion)`);
+  console.log(`   📊 EXCEL IMPORT`);
+  console.log(`     POST   /api/students/import-excel`);
+  console.log(`     POST   /api/students/import-excel-custom`);
+  console.log(`     GET    /api/students/import-template`);
+  console.log(`   📚 SUBJECTS`);
+  console.log(`     GET    /api/subjects`);
+  console.log(`     GET    /api/subjects/:id`);
+  console.log(`     POST   /api/subjects`);
+  console.log(`     PUT    /api/subjects/:id`);
+  console.log(`     DELETE /api/subjects/:id`);
+  console.log(`   👪 PARENTS`);
+  console.log(`     GET    /api/parents`);
+  console.log(`     POST   /api/parents`);
+  console.log(`   🔗 PARENT CHILD LINKING`);
+  console.log(`     GET    /api/parent/available-students`);
+  console.log(`     POST   /api/parent/link-child`);
+  console.log(`     DELETE /api/parent/unlink-child/:studentId`);
+  console.log(`   📅 ATTENDANCE`);
+  console.log(`     GET    /api/attendance`);
+  console.log(`     POST   /api/attendance`);
+  console.log(`     POST   /api/attendance/bulk`);
+  console.log(`   📊 GRADES`);
+  console.log(`     GET    /api/grades`);
+  console.log(`     POST   /api/grades`);
+  console.log(`     GET    /api/grades/filter`);
+  console.log(`     GET    /api/grades/summary/:studentId`);
+  console.log(`     GET    /api/grades/final/:studentId/:subjectId`);
+  console.log(`   📅 SESSION MANAGEMENT`);
+  console.log(`     GET    /api/sessions`);
+  console.log(`     GET    /api/sessions/active`);
+  console.log(`     POST   /api/sessions`);
+  console.log(`     PUT    /api/sessions/:id`);
+  console.log(`     POST   /api/sessions/:id/archive`);
+  console.log(`     POST   /api/sessions/next (auto-create next year)`);
+  console.log(`   📅 TERM MANAGEMENT`);
+  console.log(`     GET    /api/terms`);
+  console.log(`     GET    /api/terms/active`);
+  console.log(`     POST   /api/terms`);
+  console.log(`     PUT    /api/terms/:id`);
+  console.log(`     DELETE /api/terms/:id`);
+  console.log(`   💰 FEE MANAGEMENT`);
+  console.log(`     GET    /api/bursar/students`);
+  console.log(`     GET    /api/bursar/dashboard`);
+  console.log(`     GET    /api/fees (with term filter)`);
+  console.log(`     GET    /api/fees/summary (with term/session filter)`);
+  console.log(`     GET    /api/fees/parent`);
+  console.log(`     GET    /api/fees/:id`);
+  console.log(`     GET    /api/fees/student/:studentId`);
+  console.log(`     POST   /api/fees`);
+  console.log(`     POST   /api/fees/bulk (bulk fee creation)`);
+  console.log(`     POST   /api/fees/:feeId/payments`);
+  console.log(`     PUT    /api/fees/:id`);
+  console.log(`     DELETE /api/fees/:id`);
+  console.log(`     GET    /api/fees/receipt/:feeId`);
+  console.log(`   📊 DASHBOARDS`);
+  console.log(`     GET    /api/dashboard/principal`);
+  console.log(`     GET    /api/dashboard/admin`);
+  console.log(`     GET    /api/dashboard/bursar`);
+  console.log(`     GET    /api/dashboard/teacher (FIXED - subjects only show for teacher's assigned classes)`);
+  console.log(`     GET    /api/dashboard/parent`);
+  console.log(`     GET    /api/dashboard/student`);
+  console.log(`   ❤️ HEALTH`);
+  console.log(`     GET    /api/health`);
+});
